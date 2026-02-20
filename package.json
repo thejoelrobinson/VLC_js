@@ -1,0 +1,12 @@
+{
+  "name": "vlc-js",
+  "version": "1.0.0",
+  "description": "VLC media player compiled to WebAssembly via Emscripten",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}
