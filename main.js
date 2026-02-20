@@ -30,11 +30,11 @@ async function init() {
   });
 
   resetBtn.addEventListener('click', () => {
-    localStorage.setItem('options', '--codec=webcodec --aout=emworklet_audio -vv --input-repeat=10000');
+    localStorage.setItem('options', '--codec=avcodec -vv --input-repeat=10000');
     reloadBtn.click();
   });
 
-  options.value = localStorage.getItem('options') || '--codec=webcodec --aout=emworklet_audio -vv --input-repeat=10000';
+  options.value = localStorage.getItem('options') || '--codec=avcodec -vv --input-repeat=10000';
 
   options.addEventListener('change', () => {
     localStorage.setItem('options', options.value);
@@ -270,12 +270,12 @@ function createHandlers() {
     const step = e.shiftKey ? 0.1 : 0.02; // Shift = 10%, normal = 2%
     if (e.key === 'ArrowRight') {
       e.preventDefault();
-      const pos = Math.min(1, media_player.get_position() + step);
+      const pos = Math.min(1, Number(media_player.get_position()) + step);
       media_player.set_position(pos);
       update_overlay();
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
-      const pos = Math.max(0, media_player.get_position() - step);
+      const pos = Math.max(0, Number(media_player.get_position()) - step);
       media_player.set_position(pos);
       update_overlay();
     }
@@ -287,13 +287,13 @@ function createHandlers() {
     const step = e.shiftKey ? 20 : 5;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const vol = Math.min(100, media_player.get_volume() + step);
+      const vol = Math.min(100, Number(media_player.get_volume()) + step);
       media_player.set_volume(vol);
       media_player.set_mute(0);
       update_overlay();
     } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
       e.preventDefault();
-      const vol = Math.max(0, media_player.get_volume() - step);
+      const vol = Math.max(0, Number(media_player.get_volume()) - step);
       media_player.set_volume(vol);
       update_overlay();
     }
