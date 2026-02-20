@@ -17,19 +17,21 @@ services:
       dockerfile: Dockerfile
       args:
         # ---- Version pins ----
-        # Change these to upgrade Emscripten or target a different VLC commit.
-        # See build/README.md for upgrade instructions.
+        # Emscripten 4.0.1 — matches VLC's official CI (Feb 2025)
         EMSDK_VERSION: "4.0.1"
-        VLC_COMMIT_HASH: "06e361b127e4609e429909756212ed5e30e7d032"
+        # VLC master HEAD — has built-in WASM support, no external patches needed
+        # 65e744b0 = 2026-01-29 (latest wasm-emscripten build.sh change)
+        # Previous: 06e361b1 (2022, required 20+ patches)
+        VLC_TESTED_HASH: "65e744b0"
     volumes:
-      # Mount project root to receive build artifacts
       - ../:/host-output
-    # Copy artifacts to the project root after building
     command: >
       sh -c "
+        mkdir -p /host-output/vlc/modules/audio_output/webaudio &&
         cp /output/experimental.js /host-output/ &&
         cp /output/experimental.wasm /host-output/ &&
         cp /output/experimental.worker.js /host-output/ &&
+        cp /output/audio-worklet-processor.js /host-output/vlc/modules/audio_output/webaudio/ 2>/dev/null;
         echo 'Build artifacts copied to project root:' &&
         ls -lh /host-output/experimental.*
       "
