@@ -140,6 +140,10 @@ cd "${WORK_DIR}"
 
 diagnostic "Generating symbol export list..."
 echo "_main" > libvlc_wasm.sym
+# _malloc and _free are required by the JS wrapper (main.js, lib/libvlc.js)
+# Emscripten 4.0.1+ does not export them by default
+echo "_malloc" >> libvlc_wasm.sym
+echo "_free" >> libvlc_wasm.sym
 sed -e 's/^/_/' ./vlc/lib/libvlc.sym >> libvlc_wasm.sym
 
 # ---- Step 6: Final link step ----
