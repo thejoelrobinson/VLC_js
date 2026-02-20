@@ -150,4 +150,5 @@ cd "${WORK_DIR}"
 
 diagnostic ""
 diagnostic "Build complete! Output files:"
-ls -lh experimental.js experimental.wasm experimental.worker.js 2>/dev/null
+ls -lh experimental.js experimental.wasm 2>/dev/null
+ls -lh experimental.worker.js 2>/dev/null || true

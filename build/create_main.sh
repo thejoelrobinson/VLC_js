@@ -63,6 +63,19 @@ diagnostic "Linking VLC WebAssembly module..."
 diagnostic "  VLC path: ${PATH_VLC}"
 diagnostic "  emcc: $(which emcc)"
 
+# Locate the webaudio.js library (path varies between VLC versions)
+WEBAUDIO_JS=$(find "${PATH_VLC}" -name "webaudio.js" -path "*/audio_output/*" 2>/dev/null | head -1)
+if [ -z "${WEBAUDIO_JS}" ] && [ -f "vlcjs-upstream/lib/webaudio.js" ]; then
+    WEBAUDIO_JS="vlcjs-upstream/lib/webaudio.js"
+fi
+if [ -n "${WEBAUDIO_JS}" ]; then
+    WEBAUDIO_LIB="--js-library ${WEBAUDIO_JS}"
+    diagnostic "  webaudio.js: ${WEBAUDIO_JS}"
+else
+    WEBAUDIO_LIB=""
+    diagnostic "  WARNING: webaudio.js not found — audio output may not work"
+fi
+
 # ---- emcc flags explained ----
 #
 # --bind                    Enable Embind for C++/JS interop
@@ -86,6 +99,7 @@ diagnostic "  emcc: $(which emcc)"
 # -o experimental.js        Output filename (also creates .wasm and .worker.js)
 
 emcc --bind \
+    -Wl,--allow-multiple-definition \
     -s USE_PTHREADS=1 \
     -s TOTAL_MEMORY=2GB \
     -s PTHREAD_POOL_SIZE=25 \
@@ -110,11 +124,14 @@ emcc --bind \
     "${PATH_VLC}/build-emscripten/src/.libs/libvlccore.a" \
     "${PATH_VLC}/build-emscripten/compat/.libs/libcompat.a" \
     --js-library js-libs/wasm-imports.js \
-    --js-library "${PATH_VLC}/modules/audio_output/webaudio/webaudio.js" \
+    ${WEBAUDIO_LIB} \
     -o experimental.js
 
 checkfail "emcc linking failed"
 
 diagnostic ""
 diagnostic "Link complete. Output files:"
-ls -lh experimental.js experimental.wasm experimental.worker.js 2>/dev/null
+ls -lh experimental.js experimental.wasm 2>/dev/null
+# experimental.worker.js may or may not be generated depending on Emscripten version
+# In 4.0.1+, the worker code may be embedded in experimental.js
+ls -lh experimental.worker.js 2>/dev/null || diagnostic "  (experimental.worker.js not generated — worker code may be embedded in experimental.js)"

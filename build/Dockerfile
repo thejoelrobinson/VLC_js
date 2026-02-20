@@ -135,8 +135,10 @@ RUN mkdir -p /output
 
 COPY --from=builder /build/experimental.js /output/
 COPY --from=builder /build/experimental.wasm /output/
-COPY --from=builder /build/experimental.worker.js /output/
-# Also copy the audio worklet processor from VLC's audio output module
-COPY --from=builder /build/vlc/modules/audio_output/webaudio/audio-worklet-processor.js /output/ 2>/dev/null || true
+# worker.js may not be generated in newer Emscripten (worker code embedded in main JS)
+# audio-worklet-processor.js may be in a different path in VLC 4.0
+RUN --mount=from=builder,source=/build,target=/build-src \
+    cp /build-src/experimental.worker.js /output/ 2>/dev/null || true && \
+    find /build-src/vlc -name "audio-worklet-processor.js" -exec cp {} /output/ \; 2>/dev/null || true
 
 CMD ["sh", "-c", "cp /output/experimental.* /host-output/ 2>/dev/null && cp /output/audio-worklet-processor.js /host-output/vlc/modules/audio_output/webaudio/ 2>/dev/null; echo 'Build artifacts copied to /host-output/' || echo 'Artifacts available in /output/ — mount a volume to /host-output/ to extract them'"]
