@@ -1,0 +1,35 @@
+# VLC.js WebAssembly Build — Docker Compose
+#
+# One-command build:
+#   docker compose up
+#
+# The build artifacts (experimental.js, experimental.wasm, experimental.worker.js)
+# will be copied to the project root directory, replacing any existing files.
+#
+# To rebuild from scratch (e.g., after changing Emscripten or VLC version):
+#   docker compose build --no-cache
+#   docker compose up
+
+services:
+  vlcjs-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # ---- Version pins ----
+        # Change these to upgrade Emscripten or target a different VLC commit.
+        # See build/README.md for upgrade instructions.
+        EMSDK_VERSION: "4.0.1"
+        VLC_COMMIT_HASH: "06e361b127e4609e429909756212ed5e30e7d032"
+    volumes:
+      # Mount project root to receive build artifacts
+      - ../:/host-output
+    # Copy artifacts to the project root after building
+    command: >
+      sh -c "
+        cp /output/experimental.js /host-output/ &&
+        cp /output/experimental.wasm /host-output/ &&
+        cp /output/experimental.worker.js /host-output/ &&
+        echo 'Build artifacts copied to project root:' &&
+        ls -lh /host-output/experimental.*
+      "
