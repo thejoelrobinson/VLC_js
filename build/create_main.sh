@@ -109,7 +109,7 @@ emcc --bind \
     -s OFFSCREENCANVAS_SUPPORT=1 \
     -s MODULARIZE=1 \
     -s EXPORT_NAME="initModule" \
-    -s EXPORTED_RUNTIME_METHODS="[allocateUTF8, writeAsciiToMemory]" \
+    -s EXPORTED_RUNTIME_METHODS="[allocateUTF8, writeAsciiToMemory, wasmMemory]" \
     -s ASYNCIFY=1 \
     -O3 \
     -s EXIT_RUNTIME=1 \
