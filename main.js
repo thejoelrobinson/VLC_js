@@ -105,9 +105,23 @@ async function init() {
     createHandlers();
     localStorage.setItem('valid-options', options.value);
   } catch (e) {
+    console.error('VLC.js initialization failed:', e);
     const validOptions = localStorage.getItem('valid-options');
-    localStorage.setItem('options', validOptions);
-    window.location.reload();
+    if (validOptions) {
+      localStorage.setItem('options', validOptions);
+    }
+    // Show error to user instead of reload-looping
+    const app = document.getElementById('app');
+    if (app) {
+      app.style.display = 'block';
+      app.innerHTML = '<div style="text-align:center;padding:40px;color:#d32f2f;">'
+        + '<h2>VLC.js failed to initialize</h2>'
+        + '<pre style="text-align:left;max-width:800px;margin:20px auto;overflow:auto;background:#f5f5f5;padding:15px;border-radius:4px;">'
+        + e.message + '\n\n' + (e.stack || '')
+        + '</pre>'
+        + '<button onclick="location.reload()" style="padding:10px 20px;cursor:pointer;">Retry</button>'
+        + '</div>';
+    }
   }
 }
 
