@@ -102,6 +102,7 @@ emcc --bind \
     -Wl,--allow-multiple-definition \
     -s USE_PTHREADS=1 \
     -s TOTAL_MEMORY=2GB \
+    -s ALLOW_MEMORY_GROWTH \
     -s PTHREAD_POOL_SIZE=25 \
     -s OFFSCREEN_FRAMEBUFFER=1 \
     -s USE_WEBGL2=1 \
