@@ -74,6 +74,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     meson \
     python3 \
     python3-pip \
+    python3-venv \
     python3-setuptools \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -99,9 +100,9 @@ ARG VLC_TESTED_HASH=65e744b0
 
 WORKDIR /build
 
-# Copy our build scripts and vlc.js wrapper sources
-COPY compile.sh create_main.sh ./
-RUN chmod +x compile.sh create_main.sh
+# Copy our build scripts, wrapper patches, and vlc.js wrapper sources
+COPY compile.sh create_main.sh patch_vlcjs_wrappers.sh ./
+RUN chmod +x compile.sh create_main.sh patch_vlcjs_wrappers.sh
 
 # Clone the upstream vlc.js repository to get the C wrapper files
 # (main.c, exports_media_player.c, exports_media.c) and JS libraries
@@ -117,6 +118,10 @@ RUN mkdir -p src js-libs \
     && cp vlcjs-upstream/lib/wasm-imports.js ./js-libs/ \
     # Keep vlc.js patches in case any are still needed for wrapper integration
     && cp -r vlcjs-upstream/vlc_patches ./vlc_patches 2>/dev/null || true
+
+# Patch the vlc.js C wrapper files for VLC 4.0 API compatibility
+# (new function signatures, removed APIs)
+RUN bash patch_vlcjs_wrappers.sh ./src
 
 # Build VLC (longest step — compiles VLC + all contribs for WASM)
 RUN bash compile.sh
