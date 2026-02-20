@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <link rel="icon" href="favicon.ico">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VLC.js</title>
 
     <link href="./vlc.css" rel="stylesheet">
@@ -39,6 +40,7 @@
         </h3>
       </div>
       <div id="stack">
+        <!-- Dimensions set by Emscripten module at runtime -->
         <canvas
           class="emscripten"
           id="canvas"
@@ -47,7 +49,7 @@
           height=720
         ></canvas>
         <div id="p-overlay" class="p-overlay">
-          <div id="play-button" class="play-button eject-svg">
+          <div id="play-button" class="play-button eject-svg" role="button" aria-label="Play" tabindex="0">
             <div>
               <svg>
                 <!-- <path d="M15.562 8.1L3.87.225c-.818-.562-1.87 0-1.87.9v15.75c0 .9 1.052 1.462 1.87.9L15.563 9.9c.584-.45.584-1.35 0-1.8z"></path> -->
@@ -57,7 +59,7 @@
           </div>
           <div id="bottom-bar" class="bottom-bar">
 
-            <div id="bottom-play-button" class="bottom-bar-play-button">
+            <div id="bottom-play-button" class="bottom-bar-play-button" role="button" aria-label="Play" tabindex="0">
               <svg id="bottom-bar-play-button-svg" class="bottom-bar-play-button-svg bottom-bar-eject-button-svg">
                 <!-- <path d="M6 1H3c-.6 0-1 .4-1 1v14c0 .6.4 1 1 1h3c.6 0 1-.4 1-1V2c0-.6-.4-1-1-1zm6 0c-.6 0-1 .4-1 1v14c0 .6.4 1 1 1h3c.6 0 1-.4 1-1V2c0-.6-.4-1-1-1h-3z"></path> -->
                 <!-- <path d="M15.562 8.1L3.87.225c-.818-.562-1.87 0-1.87.9v15.75c0 .9 1.052 1.462 1.87.9L15.563 9.9c.584-.45.584-1.35 0-1.8z"></path> -->
@@ -65,18 +67,18 @@
               </svg>
             </div>
             <div class="bottom-progress-bar">
-              <div id="bottom-progress" class="progress-zone">
+              <div id="bottom-progress" class="progress-zone" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
                 <div class="bottom-progress">
                   <div id="bottom-progress-value" class="bottom-progress-value"></div>
                 </div>
               </div>
             </div>
-            <div id="time" class="bottom-bar-timer"></div>
+            <div id="time" class="bottom-bar-timer" aria-live="polite" role="timer"></div>
             <div id="volume" class="bottom-bar-volume">
-              <div id="volume-svg-wrapper" class="volume-svg-wrapper">
+              <div id="volume-svg-wrapper" class="volume-svg-wrapper" role="button" aria-label="Toggle mute" tabindex="0">
                 <svg id="volume-svg"><path d="M15.6 3.3c-.4-.4-1-.4-1.4 0-.4.4-.4 1 0 1.4C15.4 5.9 16 7.4 16 9c0 1.6-.6 3.1-1.8 4.3-.4.4-.4 1 0 1.4.2.2.5.3.7.3.3 0 .5-.1.7-.3C17.1 13.2 18 11.2 18 9s-.9-4.2-2.4-5.7z"></path><path d="M11.282 5.282a.909.909 0 000 1.316c.735.735.995 1.458.995 2.402 0 .936-.425 1.917-.995 2.487a.909.909 0 000 1.316c.145.145.636.262 1.018.156a.725.725 0 00.298-.156C13.773 11.733 14.13 10.16 14.13 9c0-.17-.002-.34-.011-.51-.053-.992-.319-2.005-1.522-3.208a.909.909 0 00-1.316 0zm-7.496.726H.714C.286 6.008 0 6.31 0 6.76v4.512c0 .452.286.752.714.752h3.072l4.071 3.858c.5.3 1.143 0 1.143-.602V2.752c0-.601-.643-.977-1.143-.601L3.786 6.008z"></path></svg>
               </div>
-              <div id="bottom-progress-volume" style="max-width: 100px;" class="progress-zone hide-volume">
+              <div id="bottom-progress-volume" style="max-width: 100px;" class="progress-zone hide-volume" role="slider" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80" tabindex="0">
                 <div class="bottom-progress-volume">
                   <div id="bottom-progress-volume-value" class="bottom-progress-volume-value"></div>
                 </div>
@@ -84,14 +86,14 @@
             </div>
           </div>
           <div id="chapter-buttons" class="chapter-buttons">
-            <div id="previous-chapter" class="chapter-button chapter-button-left">
+            <div id="previous-chapter" class="chapter-button chapter-button-left" role="button" aria-label="Previous chapter" tabindex="0">
               <div>
                 <svg viewBox="0 0 20 20">
                   <path d="M.5 3.5A.5.5 0 0 0 0 4v8a.5.5 0 0 0 1 0V8.753l6.267 3.636c.54.313 1.233-.066 1.233-.697v-2.94l6.267 3.636c.54.314 1.233-.065 1.233-.696V4.308c0-.63-.693-1.01-1.233-.696L8.5 7.248v-2.94c0-.63-.692-1.01-1.233-.696L1 7.248V4a.5.5 0 0 0-.5-.5z"/>
                 </svg>
               </div>
             </div>
-            <div id="next-chapter" class="chapter-button chapter-button-right">
+            <div id="next-chapter" class="chapter-button chapter-button-right" role="button" aria-label="Next chapter" tabindex="0">
               <div>
                 <svg viewBox="0 0 20 20">
                   <path d="M15.5 3.5a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-1 0V8.753l-6.267 3.636c-.54.313-1.233-.066-1.233-.697v-2.94l-6.267 3.636C.693 12.703 0 12.324 0 11.693V4.308c0-.63.693-1.01 1.233-.696L7.5 7.248v-2.94c0-.63.693-1.01 1.233-.696L15 7.248V4a.5.5 0 0 1 .5-.5z"/>

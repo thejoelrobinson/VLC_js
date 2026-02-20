@@ -233,6 +233,57 @@ function createHandlers() {
     window.media_player.previous_chapter();
     update_overlay();
   });
+
+  // Keyboard accessibility: activate buttons with Enter/Space
+  function addKeyboardClick(element) {
+    element.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        element.click();
+      }
+    });
+  }
+
+  addKeyboardClick(playButton);
+  addKeyboardClick(bPlayButton);
+  addKeyboardClick(volumeSvgWrapper);
+  addKeyboardClick(nextChapter);
+  addKeyboardClick(previousChapter);
+
+  // Keyboard accessibility: seek with arrow keys on progress bar
+  progressTotal.addEventListener('keydown', (e) => {
+    if (!window.files || !window.files.length) return;
+    const step = e.shiftKey ? 0.1 : 0.02; // Shift = 10%, normal = 2%
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      const pos = Math.min(1, media_player.get_position() + step);
+      media_player.set_position(pos);
+      update_overlay();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const pos = Math.max(0, media_player.get_position() - step);
+      media_player.set_position(pos);
+      update_overlay();
+    }
+  });
+
+  // Keyboard accessibility: volume control with arrow keys
+  progressVolumeTotal.addEventListener('keydown', (e) => {
+    if (!window.files || !window.files.length) return;
+    const step = e.shiftKey ? 20 : 5;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const vol = Math.min(100, media_player.get_volume() + step);
+      media_player.set_volume(vol);
+      media_player.set_mute(0);
+      update_overlay();
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      const vol = Math.max(0, media_player.get_volume() - step);
+      media_player.set_volume(vol);
+      update_overlay();
+    }
+  });
 };
 
 window.onload = function () {
