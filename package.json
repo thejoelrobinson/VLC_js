@@ -4,9 +4,15 @@
   "description": "VLC media player compiled to WebAssembly via Emscripten",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "engines": {
-    "node": ">=14"
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "jsdom": "^28.1.0",
+    "vitest": "^4.0.18"
   }
 }
