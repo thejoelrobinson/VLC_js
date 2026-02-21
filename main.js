@@ -30,11 +30,11 @@ async function init() {
   });
 
   resetBtn.addEventListener('click', () => {
-    localStorage.setItem('options', '--codec=avcodec -vv --input-repeat=10000');
+    localStorage.setItem('options', '--codec=webcodec --aout=adummy --avcodec-threads=1');
     reloadBtn.click();
   });
 
-  options.value = localStorage.getItem('options') || '--codec=avcodec -vv --input-repeat=10000';
+  options.value = localStorage.getItem('options') || '--codec=webcodec --aout=adummy --avcodec-threads=1';
 
   options.addEventListener('change', () => {
     localStorage.setItem('options', options.value);
@@ -201,9 +201,20 @@ function createHandlers() {
   const playButton = document.getElementById('play-button');
   const bPlayButton = document.getElementById('bottom-play-button');
 
+  // Track playing state in window._vlcIsPlaying to avoid calling
+  // libvlc_media_player_is_playing() on the main thread (it acquires
+  // vlc_player_Lock → pthread_cond_timedwait → blocks main thread → abort).
+  window._vlcIsPlaying = false;
+
   function handlePlayPause() {
     if (globalThis.files) {
-      media_player.toggle_play();
+      if (window._vlcIsPlaying) {
+        media_player.pause();
+        window._vlcIsPlaying = false;
+      } else {
+        media_player.play();
+        window._vlcIsPlaying = true;
+      }
     } else {
       inputElement.click();
     }

@@ -6,13 +6,15 @@
   "scripts": {
     "start": "node server.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:browser": "vitest run tests/mxf-browser-playback.test.js"
   },
   "engines": {
     "node": ">=18"
   },
   "devDependencies": {
     "jsdom": "^28.1.0",
+    "playwright-core": "^1.58.2",
     "vitest": "^4.0.18"
   }
 }

@@ -101,12 +101,32 @@ Key Emscripten flags used in the link step:
 -O3
 ```
 
-## Known Bugs
+## Known Bugs — Status
 
-1. `lib/libvlc.js:239` — template literal missing `$`: `{path}` should be `${path}`
-2. `lib/module-loader.js:10,13` — duplicate `var was_clicked = false;` declaration
-3. `server.js:21` — no path traversal protection (`../` in URL can read arbitrary files)
-4. `vlc.html:45` — inline `oncontextmenu` handler violates CSP
+All four original bugs are **fixed** in `dev/js-updates`:
+
+1. `lib/libvlc.js:239` — ~~template literal missing `$`~~ — **FIXED**
+2. `lib/module-loader.js:10,13` — ~~duplicate `var was_clicked`~~ — **FIXED**
+3. `server.js:21` — ~~no path traversal protection~~ — **FIXED** (resolves path, checks startsWith ROOT)
+4. `vlc.html:45` — ~~inline `oncontextmenu`~~ — **FIXED** (moved to `addEventListener` in main.js)
+
+## AI Agent Team Structure
+
+When this project requires multi-step investigation and implementation, spawn a team using these roles. Each maps to a Claude Code agent type.
+
+| Role | Agent Type | Responsibilities |
+|---|---|---|
+| **forensics** | `Explore` (read-only) | Deep code analysis — API compatibility, git history diffs, build script auditing, finding silent failures. Returns findings; does NOT edit files. |
+| **js-fixer** | `general-purpose` | JS/HTML/CSS/build-script edits. Implements fixes from forensics findings. Runs `npm test` after every change. |
+| **test-engineer** | `general-purpose` | Writes new tests in `tests/`. Never modifies existing test files. Verifies full test suite passes after additions. |
+| **overseer** | `general-purpose` | Final QA pass. Runs `npm test`, checks `git diff`, validates CLAUDE.md known-bug list, reviews test quality, writes summary report. Spawned last, blocked on js-fixer + test-engineer completing. |
+
+### Team spin-up pattern
+```
+TeamCreate → TaskCreate (one per role) → Task (spawn agents with team_name) → wait for messages → TaskUpdate(completed) → TeamDelete
+```
+
+Set the overseer task `addBlockedBy` on js-fixer and test-engineer task IDs so it only runs after both complete.
 
 ## Rules for AI/LLM Assistants
 
@@ -121,10 +141,15 @@ Key Emscripten flags used in the link step:
 
 ## Modernization Goals
 
-1. **Security** — fix path traversal, remove inline handlers, CSP readiness
-2. **Accessibility** — ARIA labels, keyboard navigation, screen reader support
-3. **Responsive design** — mobile/tablet support, remove hardcoded 1280x720
-4. **Code quality** — strict equality, extract inline scripts, modern JS patterns
-5. **Testing** — unit tests for JS wrapper, server, and UI logic
-6. **Build pipeline** — Dockerized WASM build, Emscripten SDK upgrade
-7. **CI/CD** — GitHub Actions for tests and optional WASM rebuild
+**Primary goal: Full WebCodecs playback — feature-complete and as functional as the original v1.0 build.**
+
+The `webcodec` VLC plugin (in `build/webcodec/`) must be compiled into the WASM binary so VLC uses the browser's native `VideoDecoder` API (WebCodecs) for H.264 and other hardware-accelerated codecs. This avoids FFmpeg frame threading (`thread_get_buffer()` failures) and gives native-speed decode.
+
+1. **WebCodecs playback** — rebuild WASM with webcodec plugin; MXF, H.264, HEVC via browser VideoDecoder ← **TOP PRIORITY**
+2. **Security** — ✅ path traversal fixed, inline handlers removed, CSP readiness
+3. **Accessibility** — ✅ ARIA labels, keyboard navigation; further improvements welcome
+4. **Responsive design** — mobile/tablet support, remove hardcoded 1280x720
+5. **Code quality** — ✅ strict equality, extracted inline scripts, modern JS patterns
+6. **Testing** — ✅ unit tests for JS wrapper, server, UI logic, MXF playback paths
+7. **Build pipeline** — Dockerized WASM build, Emscripten SDK upgrade
+8. **CI/CD** — GitHub Actions for tests and optional WASM rebuild

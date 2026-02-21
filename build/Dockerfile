@@ -104,6 +104,10 @@ WORKDIR /build
 COPY compile.sh create_main.sh patch_vlcjs_wrappers.sh ./
 RUN chmod +x compile.sh create_main.sh patch_vlcjs_wrappers.sh
 
+# Copy ported WebCodec sources — injected into VLC tree by compile.sh
+# (bypasses git am which fails against VLC 4.0 due to API drift)
+COPY webcodec/ webcodec/
+
 # Clone the upstream vlc.js repository to get the C wrapper files
 # (main.c, exports_media_player.c, exports_media.c) and JS libraries
 # (wasm-imports.js) that bridge VLC's C API to JavaScript.

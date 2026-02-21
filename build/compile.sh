@@ -116,6 +116,65 @@ if [ ! -d vlc ]; then
         diagnostic "No vlc.js patches found — using VLC master as-is (expected for recent commits)"
     fi
 
+    # ---- Step 3b: Inject WebCodec module sources (bypasses git am for VLC 4.0 compat) ----
+    # The upstream webcodec patches fail git am against VLC 4.0 due to API drift.
+    # Instead, we copy the ported source files directly and apply minimal header edits.
+    if [ -d ../webcodec ]; then
+        diagnostic "Injecting WebCodec sources into VLC tree..."
+
+        cp ../webcodec/webcodec.cpp modules/codec/webcodec.cpp
+        mkdir -p modules/video_output/emscripten
+        cp ../webcodec/common.h modules/video_output/emscripten/common.h
+        cp ../webcodec/interop_emscripten.cpp modules/video_output/opengl/interop_emscripten.cpp
+
+        # vlc_codec.h: add VLC_DECODER_DEVICE_WEBCODEC after VLC_DECODER_DEVICE_MMAL
+        sed -i 's/VLC_DECODER_DEVICE_MMAL,/VLC_DECODER_DEVICE_MMAL,\n    VLC_DECODER_DEVICE_WEBCODEC,/' include/vlc_codec.h
+        if ! grep -q 'VLC_DECODER_DEVICE_WEBCODEC' include/vlc_codec.h; then
+            diagnostic "ERROR: sed failed to inject VLC_DECODER_DEVICE_WEBCODEC into vlc_codec.h — pattern 'VLC_DECODER_DEVICE_MMAL,' not found"
+            exit 1
+        fi
+
+        # vlc_picture.h: add VLC_VIDEO_CONTEXT_WEBCODEC after VLC_VIDEO_CONTEXT_MMAL
+        sed -i 's/VLC_VIDEO_CONTEXT_MMAL,/VLC_VIDEO_CONTEXT_MMAL,\n    VLC_VIDEO_CONTEXT_WEBCODEC,/' include/vlc_picture.h
+        if ! grep -q 'VLC_VIDEO_CONTEXT_WEBCODEC' include/vlc_picture.h; then
+            diagnostic "ERROR: sed failed to inject VLC_VIDEO_CONTEXT_WEBCODEC into vlc_picture.h — pattern 'VLC_VIDEO_CONTEXT_MMAL,' not found"
+            exit 1
+        fi
+
+        # vlc_fourcc.h: add VLC_CODEC_WEBCODEC_OPAQUE after VLC_CODEC_CVPX_P010
+        sed -i "/VLC_CODEC_CVPX_P010/a #define VLC_CODEC_WEBCODEC_OPAQUE VLC_FOURCC('W','C','O','P')" include/vlc_fourcc.h
+        if ! grep -q 'VLC_CODEC_WEBCODEC_OPAQUE' include/vlc_fourcc.h; then
+            diagnostic "ERROR: sed failed to inject VLC_CODEC_WEBCODEC_OPAQUE into vlc_fourcc.h — pattern 'VLC_CODEC_CVPX_P010' not found"
+            exit 1
+        fi
+
+        # fourcc.c: add GPU_FMT(OTHER,0) entry after CVPX_P010
+        sed -i '/VLC_CODEC_CVPX_P010.*GPU_FMT/a\    { VLC_CODEC_WEBCODEC_OPAQUE,        GPU_FMT(OTHER, 0) },' src/misc/fourcc.c
+        if ! grep -q 'VLC_CODEC_WEBCODEC_OPAQUE' src/misc/fourcc.c; then
+            diagnostic "ERROR: sed failed to inject VLC_CODEC_WEBCODEC_OPAQUE into fourcc.c — pattern 'VLC_CODEC_CVPX_P010.*GPU_FMT' not found"
+            exit 1
+        fi
+
+        # modules/codec/Makefile.am: register webcodec plugin
+        printf '\nlibwebcodec_plugin_la_SOURCES = codec/webcodec.cpp\n'       >> modules/codec/Makefile.am
+        printf 'libwebcodec_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++20\n'  >> modules/codec/Makefile.am
+        printf 'libwebcodec_plugin_la_LDFLAGS = $(AM_LDFLAGS) -s ASYNCIFY=1\n' >> modules/codec/Makefile.am
+        printf 'if HAVE_EMSCRIPTEN\ncodec_LTLIBRARIES += libwebcodec_plugin.la\nendif\n' >> modules/codec/Makefile.am
+
+        # modules/video_output/Makefile.am: register glinterop_emscripten plugin
+        printf '\n### Emscripten WebCodec interop\n'                          >> modules/video_output/Makefile.am
+        printf 'libglinterop_emscripten_plugin_la_SOURCES = video_output/opengl/interop_emscripten.cpp video_output/opengl/interop.h\n' >> modules/video_output/Makefile.am
+        printf 'libglinterop_emscripten_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++20 -DUSE_OPENGL_ES2\n' >> modules/video_output/Makefile.am
+        printf 'libglinterop_emscripten_plugin_la_LDFLAGS = $(AM_LDFLAGS) -s ASYNCIFY=1\n' >> modules/video_output/Makefile.am
+        printf 'if HAVE_EMSCRIPTEN\nvout_LTLIBRARIES += libglinterop_emscripten_plugin.la\nendif\n' >> modules/video_output/Makefile.am
+
+        diagnostic "  webcodec.cpp, interop_emscripten.cpp, common.h injected"
+        diagnostic "  Header edits applied (vlc_codec.h, vlc_picture.h, vlc_fourcc.h, fourcc.c)"
+        diagnostic "  Makefile.am entries added"
+    else
+        diagnostic "No webcodec/ directory found — skipping WebCodec injection"
+    fi
+
     cd "${WORK_DIR}"
 else
     diagnostic "VLC source directory already exists, skipping clone"

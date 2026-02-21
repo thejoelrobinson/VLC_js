@@ -3,8 +3,10 @@
 # One-command build:
 #   docker compose up
 #
-# The build artifacts (experimental.js, experimental.wasm, experimental.worker.js)
-# will be copied to the project root directory, replacing any existing files.
+# NOTE: The current project root uses the v1.0-working binary which includes
+# the webcodec module (required for 4K playback via browser WebCodecs API).
+# The VLC 4.0 build does NOT include webcodec — do not run `docker compose up`
+# unless you intend to replace the binary with the VLC 4.0 version.
 #
 # To rebuild from scratch (e.g., after changing Emscripten or VLC version):
 #   docker compose build --no-cache
