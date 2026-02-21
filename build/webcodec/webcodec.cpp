@@ -289,11 +289,6 @@ static void WebcodecDecodeWorkerTick( void* arg )
         auto chunk = blockToEncodedVideoChunk( dec, block );
         block_Release(block);
         sys->decoder.call<void>( "decode", chunk );
-
-        auto queueSize = sys->decoder["decodeQueueSize"];
-        auto state = sys->decoder["state"];
-        msg_Dbg( dec, "Decoder state: %s ; queue size: %ld",
-                 state.as<std::string>().c_str(), queueSize.as<long int>());
     }
 }
 
@@ -399,7 +394,15 @@ static int Open( vlc_object_t* obj )
 static void Close( decoder_t* dec )
 {
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
-    sys->decoder.call<void>("close");
+    // Do NOT call sys->decoder.call<void>("close") here.
+    // In Emscripten 4.0.1, emscripten::val has strict thread affinity:
+    // sys->decoder (JS VideoDecoder) was created on WebcodecDecodeWorker
+    // but Close() is called by VLC's input/demux thread.
+    // Calling .call() from the wrong thread triggers:
+    //   "val accessed from wrong thread" → abort() → heap corruption.
+    // The JS VideoDecoder will be garbage-collected when the emval handle
+    // is dropped via the emval destructor (which only calls _emval_decref,
+    // a thread-safe reference count decrement — no thread check).
     delete sys;
 }
 
