@@ -157,7 +157,7 @@ if [ ! -d vlc ]; then
 
         # modules/codec/Makefile.am: register webcodec plugin
         printf '\nlibwebcodec_plugin_la_SOURCES = codec/webcodec.cpp\n'       >> modules/codec/Makefile.am
-        printf 'libwebcodec_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++20\n'  >> modules/codec/Makefile.am
+        printf 'libwebcodec_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++20 -DNDEBUG\n'  >> modules/codec/Makefile.am
         printf 'libwebcodec_plugin_la_LDFLAGS = $(AM_LDFLAGS) -s ASYNCIFY=1\n' >> modules/codec/Makefile.am
         printf 'if HAVE_EMSCRIPTEN\ncodec_LTLIBRARIES += libwebcodec_plugin.la\nendif\n' >> modules/codec/Makefile.am
 

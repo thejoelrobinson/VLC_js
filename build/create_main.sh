@@ -117,7 +117,7 @@ emcc --bind \
     -s ASYNCIFY=1 \
     -O3 \
     -s EXIT_RUNTIME=1 \
-    -s ASSERTIONS=1 \
+    -s ASSERTIONS=0 \
     -I "${PATH_VLC}/include/" \
     src/main.c src/exports_media_player.c src/exports_media.c \
     -s EXPORTED_FUNCTIONS=@libvlc_wasm.sym \

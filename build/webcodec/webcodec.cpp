@@ -304,6 +304,15 @@ static void* WebcodecDecodeWorker( void* arg )
     auto vctxPrivate = static_cast<webcodec_context*>(
             vlc_video_context_GetPrivate(sys->vctx, VLC_VIDEO_CONTEXT_WEBCODEC));
     vctxPrivate->decoder_worker = pthread_self();
+
+    // Use emscripten_set_main_loop_arg to schedule the decode tick via the
+    // worker's JS event loop. The C function returns (thread "exits") but
+    // the JS callbacks keep running on the same worker.
+    //
+    // Emscripten 4.0.1's val.h asserts pthread_equal(thread, pthread_self())
+    // in as_handle() using assert(). We compile webcodec with -DNDEBUG so
+    // assert() is a no-op — the emval operations remain safe because the
+    // JS callbacks run on the same worker that created sys->decoder.
     emscripten_set_main_loop_arg( &WebcodecDecodeWorkerTick, dec, 0, false );
     emscripten_set_main_loop_timing( EM_TIMING_SETTIMEOUT, 1 );
     return NULL;

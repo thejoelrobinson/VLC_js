@@ -29,7 +29,7 @@ const MXF_FILE     = join(PROJECT_ROOT, 'A009C233_260209D4_CANON.MXF');
 const SERVER_PORT  = 3099; // avoid conflict with npm start (3000)
 const SERVER_URL   = `http://localhost:${SERVER_PORT}`;
 
-const DECODE_TIMEOUT_MS  = 25_000; // wait up to 25s for frames
+const DECODE_TIMEOUT_MS  = 30_000; // wait up to 30s for frames (covers threading errors that appear ~20s in)
 const MIN_FRAMES_DECODED = 10;     // must decode at least this many frames
 
 // ── Minimal dev server ────────────────────────────────────────────────────
@@ -123,6 +123,7 @@ async function runPlaybackTest(browser, mxfPath) {
       getBufferErrors:   errors.filter(m => m.text.includes('get_buffer')).map(m => m.text),
       heapErrors:        errors.filter(m => m.text.includes('Aborted') || m.text.includes('heap')).map(m => m.text.slice(0, 160)),
       closedCodecErrors: errors.filter(m => m.text.includes('closed codec')).map(m => m.text.slice(0, 160)),
+      valThreadErrors:   errors.filter(m => m.text.includes('wrong thread') || m.text.includes('pthread_equal')).map(m => m.text.slice(0, 160)),
       syntaxErrors:      errors.filter(m => m.type === 'pageerror').map(m => m.text.slice(0, 160)),
     };
   } finally {
@@ -199,6 +200,13 @@ describe('MXF WebCodecs browser playback', () => {
     expect(
       sharedResult.closedCodecErrors,
       `VideoDecoder closed unexpectedly:\n${sharedResult.closedCodecErrors.join('\n')}`
+    ).toHaveLength(0);
+
+    // emval thread affinity crash — val accessed from wrong thread
+    // (emscripten_set_main_loop_arg recycles pthread after C fn exits)
+    expect(
+      sharedResult.valThreadErrors,
+      `emval thread affinity violation (ASSERTIONS=1 build?):\n${sharedResult.valThreadErrors?.join('\n')}`
     ).toHaveLength(0);
 
     // JavaScript syntax errors in our patches
