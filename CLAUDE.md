@@ -2,212 +2,367 @@
 
 ## Project Overview
 
-VLC.js is VLC media player compiled to WebAssembly via Emscripten. It plays video/audio files entirely in the browser using a 31 MB WASM binary containing VLC core + FFmpeg codecs + the webcodec plugin.
+VLC.js is VLC 4.0 compiled to WebAssembly via Emscripten 4.0.1. It plays video and audio files entirely in the browser using a 31 MB WASM binary containing VLC core + FFmpeg codecs + the webcodec plugin + audio worklet module.
 
-**Upstream source:** https://code.videolan.org/jbk/vlc.js/ (use `incoming` branch, not `master`)
-**Status:** Upstream is unmaintained (last commit Oct 2022). This fork has been substantially modernized: VLC upgraded to 4.0 master, Emscripten upgraded to 4.0.1, WebCodecs H.264/MXF playback implemented, full test suite added, Dockerized build pipeline.
+**Upstream source:** https://code.videolan.org/jbk/vlc.js/ (the `incoming` branch, not `master`)
+**Working reference demo:** https://videolabs.io/communication/vlcjs-demo/vlc.html (uses VLC 4.0-dev Oct 2022, Emscripten 3.1.18)
+**Status:** This fork upgrades to VLC 4.0 master (Jan 2026), Emscripten 4.0.1, working video + audio.
 
-**Current build:** VLC 4.0 master + Emscripten 4.0.1, webcodec plugin compiled in, all 87 tests passing.
+---
 
-## Architecture
+## Full Architecture
 
 ```
-Browser UI (vlc.html, vlc.css)
-    ↓
-main.js — app entry point, event wiring, VLC option management
-    ↓
-JS Wrapper Layer (lib/libvlc.js, lib/overlay.js, lib/module-loader.js)
-    ↓
-Emscripten Glue (experimental.js) — generated, do not hand-edit
-    ↓
-WASM Binary (experimental.wasm) — compiled VLC 4.0 + FFmpeg + webcodec plugin, 31 MB
-    ↓
-Web Workers (experimental.worker.js) — POSIX thread emulation via pthreads
-    ↓
-Audio Output (audio-worklet-processor.js) — Web Audio API AudioWorklet (SAB/Atomics protocol)
-    ↓ (WebCodecs path only)
-Browser VideoDecoder API — hardware-accelerated H.264/HEVC decode
+┌─────────────────────────────────────────────────────────────────┐
+│  Browser UI  (vlc.html + vlc.css)                               │
+│  Nav menu, canvas, file picker, progress bar, chapter buttons   │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────────┐
+│  main.js  (app entry point, ES module)                          │
+│  · Initializes VLC with option string from localStorage         │
+│  · Wires file picker, play/pause, seek, volume events           │
+│  · Tracks _vlcIsPlaying state (avoids blocking main thread)     │
+│  · Calls update_overlay() and on_overlay_click()                │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────────┐
+│  JS Wrapper Layer                                                │
+│  · lib/libvlc.js — MediaPlayer + Media classes (WASM bindings)  │
+│  · lib/overlay.js — UI update loop (play/pause icons, timer)    │
+│  · lib/module-loader.js — Emscripten Module config + patches    │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  ┌──────────┐  ┌───────────┐  ┌───────────────────────────────┐
+  │WASM Core │  │  Audio    │  │  Video (WebCodecs path)        │
+  │(VLC 4.0) │  │ Pipeline  │  │                                │
+  └──────────┘  └───────────┘  └───────────────────────────────┘
 ```
 
-### WebCodecs Rendering Path
+---
 
-For H.264/MXF files, frames bypass VLC's GL rendering pipeline entirely:
+## Video Pipeline (WebCodecs — main path for H.264/MXF)
 
-1. VLC's webcodec C++ plugin calls `VideoDecoder.decode()` via EM_ASYNC_JS
-2. Decoded `VideoFrame` objects are delivered via `window.vlcOnDecoderFrame()` callback (Emscripten callHandler)
-3. `module-loader.js` intercepts frames and draws them directly to the canvas via `ctx.drawImage(frame)` (2D context)
-4. VLC's glinterop plugin is NOT used for WebCodecs — `VLC_CODEC_WEBCODEC_OPAQUE` frames are handled in JS
+```
+VLC demux thread (pthread)
+  └─ MXF/H.264 elementary stream
+       │
+       ▼
+webcodec.cpp Open()  ← VLC calls this to open decoder
+  · probeConfig() via EM_ASYNC_JS
+    - deferred configure: defer until first chunk (need SPS for codec string)
+  · spawns decoder worker thread via vlc_clone()
+       │
+       ▼
+WebcodecDecodeWorker (pthread)
+  · initDecoder() creates JS VideoDecoder
+  · declareCallbacks() sets up Module.boundOutputCb
+  · WebcodecDecodeWorkerTick() calls decoder.decode(chunk) per frame
+       │
+       ▼  [first chunk arrives]
+VideoDecoder.prototype.decode interceptor (experimental.js JS patch)
+  · Detects format: Annex B (00 00 00 01 start codes) or AVCC (length-prefix)
+  · Extracts actual H.264 profile/level from SPS NAL unit
+    - Canon Cinema EOS 4K MXF: avc3.7a0033 (High 4:2:2 Profile Level 5.1)
+  · Applies deferred configure() with correct codec string
+    - Uses avc3.* (Annex B) not avc1.* (AVCC) — VLC packetizer outputs Annex B
+    - avc3 = Annex B; Chrome reads actual params from SPS; no description needed
+  · Calls original VideoDecoder.decode(annexBChunk)
+       │
+       ▼
+Browser VideoDecoder (hardware via VideoToolbox on macOS, or SW)
+  · Hardware decode of 4K H.264 High 4:2:2 Profile
+  · Fires output callback → Module.boundOutputCb(VideoFrame)
+       │
+       ▼
+Module.boundOutputCb (decoder worker)
+  · Calls _createAndQueuePicture(ctx, pid, BigInt(timestamp))
+    - Tells VLC there is a picture to display (updates vout state machine)
+    - Returns null if decoder_UpdateVideoOutput fails (silently skips)
+  · Sends frame via callHandler to main thread:
+    self.postMessage({cmd:'callHandler', handler:'vlcOnDecoderFrame',
+                      args:[pid, VideoFrame]}, [VideoFrame])
+       │
+       ▼
+window._vlcOnDecoderFrame (main thread, module-loader.js)
+  · Gets 2D canvas context (_vlcGetCanvas2d())
+  · ctx.drawImage(frame, 0, 0, width, height)   ← direct hardware render
+  · frame.close()   ← free GPU memory
+```
+
+**Why direct canvas rendering instead of VLC's GL pipeline:**
+VLC 4.0's WASM vout doesn't properly route `VLC_CODEC_WEBCODEC_OPAQUE` frames to the `glinterop_emscripten` plugin. The `decoder_UpdateVideoOutput` step runs (keeping VLC's state machine happy) but the glinterop `Open()` is never called. Bypassing with `ctx.drawImage(VideoFrame)` works because it's a native browser operation that's hardware-accelerated and requires no GL context setup.
+
+---
+
+## Audio Pipeline (emworklet — Web Audio API AudioWorklet)
+
+```
+VLC audio decoder thread (pthread)
+  └─ PCM Float32 samples decoded from audio track
+       │
+       ▼
+emscripten.c Open() + Start()
+  · Allocates SharedArrayBuffer ring buffer (1 MB + 5×int32 header):
+    SAB layout: [is_paused|head|tail|can_write|volume|Float32 samples...]
+  · Calls webaudio_init(rate, channels, sab_ptr, latency) → webaudio.js
+       │
+       ▼
+webaudio.js (JS library linked via --js-library)
+  · new AudioContext({sampleRate, latencyHint})
+  · audioCtx.audioWorklet.addModule('./audio-worklet-processor.js')
+  · new AudioWorkletNode(audioCtx, 'worklet-processor', {outputChannelCount})
+  · Posts {type:'recv-audio-queue', data:wasmMemory.buffer, sab_ptr} to node
+  · node.connect(audioCtx.destination)
+  · audioCtx.resume()
+       │
+       ▼
+audio-worklet-processor.js (AudioWorklet thread, separate from main)
+  · Receives 'recv-audio-queue' message with SAB views:
+    this.head = new Uint32Array(buf, sab_ptr+4, 1)
+    this.tail = new Uint32Array(buf, sab_ptr+8, 1)
+    this.can_write = new Int32Array(buf, sab_ptr+12, 1)
+    this.volume = new Int32Array(buf, sab_ptr+16, 1)
+    this.storage = new Float32Array(buf, sab_ptr+20, STORAGE_SIZE/4)
+  · process() called by browser at audio rate (44.1 kHz):
+    - Reads head/tail via Atomics.load (lock-free ring buffer)
+    - Copies samples storage[tail..head] → output channels
+    - Applies volume scaling (Atomics.load(volume) / 400)
+    - Updates tail via Atomics.store, wakes VLC via Atomics.notify
+       │
+       ▲
+emscripten.c Play() callback (VLC audio decode thread, runs continuously)
+  · Writes Float32 samples to SAB storage ring buffer
+  · Advances head pointer via Atomics.store
+  · Calls js_index_wait() if buffer full → Atomics.wait until space
+```
+
+**SharedArrayBuffer requirement:** Both WASM and AudioWorklet need SharedArrayBuffer access. The server serves COOP/COEP headers which enable this. AudioWorklet runs in a separate thread; ring buffer + Atomics provides zero-copy, low-latency audio without MessagePort overhead.
+
+---
 
 ## Key Files
 
 | File | Editable? | Purpose |
 |---|---|---|
-| `main.js` | YES | App entry point — event wiring, VLC option management, file input; extracted from inline `vlc.html` scripts |
-| `lib/libvlc.js` | YES | `MediaPlayer` and `Media` classes wrapping WASM function calls |
-| `lib/overlay.js` | YES | UI controls: play/pause, progress bar, volume, chapters |
-| `lib/module-loader.js` | YES | Emscripten module init + VideoDecoder patching (bare `avc1` → `avc1.640028`) + direct canvas rendering for WebCodecs frames |
-| `vlc.html` | YES | Main page — canvas, file picker; scripts extracted to `main.js` (114 lines, down from 352) |
-| `vlc.css` | YES | Styling — now responsive with dark mode support (was hardcoded 1280x720) |
-| `audio-worklet-processor.js` | YES | AudioWorklet using SAB + Atomics protocol to receive PCM from WASM |
+| `main.js` | YES | App entry point — VLC init, event wiring, `window._vlcIsPlaying` state |
+| `lib/libvlc.js` | YES | `MediaPlayer` + `Media` wrapping WASM calls; `is_playing()` returns cached state (VLC 4.0 `vlc_player_Lock` blocks main thread) |
+| `lib/overlay.js` | YES | UI update loop; uses `window._vlcIsPlaying` NOT `is_playing()` |
+| `lib/module-loader.js` | YES | Emscripten Module config; VideoDecoder patches; `_vlcOnDecoderFrame` direct canvas renderer; audio frame storage |
+| `audio-worklet-processor.js` | YES | SAB + Atomics ring buffer AudioWorklet processor |
+| `vlc.html` | YES | Main page (114 lines); scripts extracted to `main.js` |
+| `vlc.css` | YES | Responsive dark-mode styles |
 | `server.js` | YES | Dev server — COOP/COEP headers, path traversal protection |
-| `build/compile.sh` | YES | Docker build script — clones VLC master, applies patches, injects webcodec plugin, links with Emscripten 4.0.1 |
-| `build/Dockerfile` | YES | Docker image for reproducible WASM builds |
-| `build/webcodec/` | YES | webcodec VLC plugin source: `webcodec.cpp`, `interop_emscripten.cpp`, `common.h` |
-| `build/vlc_patches/` | YES | Patch series applied to VLC source before build |
-| `tests/` | YES (add only) | Vitest unit tests — libvlc, server, HTML structure, MXF playback |
-| `vitest.config.js` | YES | Vitest configuration |
-| `experimental.js` | NO | Emscripten-generated glue code (~364 KB) — VLC 4.0 + Emscripten 4.0.1 |
-| `experimental.wasm` | NO | Compiled binary (31 MB) — VLC 4.0 + webcodec plugin; requires Docker rebuild to change |
-| `experimental.worker.js` | NO | Emscripten-generated worker bootstrap |
+| `build/compile.sh` | YES | Build script — injects webcodec + audio C sources, applies patches |
+| `build/Dockerfile` | YES | Multi-stage Docker build for reproducible WASM |
+| `build/webcodec/` | YES | webcodec VLC plugin: `webcodec.cpp`, `interop_emscripten.cpp`, `common.h` |
+| `build/audio/` | YES | Audio worklet VLC module: `emscripten.c`, `webaudio.c/h`, `audio-worklet-processor.js` |
+| `build/js-libs/webaudio.js` | YES | JS library for emcc `--js-library` — provides `webaudio_init/getSampleRate/getChannels` |
+| `build/vlc_patches/aug/` | YES | 81 patch files applied to VLC source before build |
+| `tests/` | YES (add) | 93 Vitest tests: libvlc API, server, HTML, MXF playback, browser integration |
+| `experimental.js` | NO* | Emscripten-generated glue (~367 KB); see JS patches section below |
+| `experimental.wasm` | NO | Compiled binary (31 MB) — requires Docker rebuild to change |
+| `experimental.worker.js` | NO | Emscripten worker bootstrap |
+
+---
+
+## experimental.js JS Patches
+
+The compiled `experimental.js` requires runtime JS patches to work with VLC 4.0 / Emscripten 4.0.1. These are applied after every Docker build:
+
+| Patch | Location | Why |
+|---|---|---|
+| VideoDecoder deferred configure | Top of file (prototype) | Defer `configure()` until first chunk arrives so SPS codec can be read; use `avc3.7a0033` (Annex B, correct H.264 profile) |
+| probeConfig dimension + codec fix | `probeConfig` function | Zero dimensions rejected by `isConfigSupported`; bare `avc1` → `avc3.7a0033` |
+| `globalThis.Module` → `Module` | webcodec EM_JS functions | `globalThis.Module` undefined on worker threads; use closure var `Module` |
+| `bindVideoFrame` → `window._vlcAwaitFrame` | `__asyncjs__bindVideoFrame` | VLC 4.0 glinterop never opens; route frames through JS-side frame storage |
+| `boundOutputCb` null guard | boundOutputCb function | Prevent null `webCodecCtx` from causing WASM heap corruption |
+
+These patches are applied by the Python script in the deploy step. The source fixes are in `build/webcodec/webcodec.cpp` and `build/js-libs/webaudio.js` for future rebuilds.
+
+---
+
+## WASM Build Pipeline
+
+```
+docker compose -f build/docker-compose.yml build
+docker compose -f build/docker-compose.yml up   ← copies artifacts to project root
+```
+
+**Build steps in `build/compile.sh`:**
+
+1. Activate Emscripten SDK 4.0.1
+2. Clone VLC master at commit `65e744b0` (2026-01-29)
+3. Apply `build/vlc_patches/aug/` patch series (most skip as already merged)
+4. **Step 3b: Inject webcodec sources** (`build/webcodec/` → VLC tree)
+   - Copies `webcodec.cpp`, `interop_emscripten.cpp`, `common.h`
+   - Injects `VLC_DECODER_DEVICE_WEBCODEC`, `VLC_VIDEO_CONTEXT_WEBCODEC`, `VLC_CODEC_WEBCODEC_OPAQUE` into headers via `sed`
+   - Adds `libwebcodec_plugin.la` to `modules/codec/Makefile.am`
+5. **Step 3c: Inject audio sources** (`build/audio/` → VLC tree)
+   - Copies `emscripten.c`, `webaudio.c/h`, `audio-worklet-processor.js`
+   - Adds `libemworklet_audio_plugin.la` to `modules/audio_output/Makefile.am`
+6. Run VLC's built-in WASM build (`extras/package/wasm-emscripten/build.sh`)
+7. Generate symbol export list (`libvlc_wasm.sym`)
+8. Final `emcc` link step (`create_main.sh`) with:
+   - `--js-library js-libs/wasm-imports.js` (file access module)
+   - `--js-library js-libs/webaudio.js` (audio bridge functions)
+   - All flags: USE_PTHREADS, TOTAL_MEMORY=2GB, ALLOW_MEMORY_GROWTH, PTHREAD_POOL_SIZE=25, ASYNCIFY=1, MODULARIZE=1, OFFSCREENCANVAS_SUPPORT=1, etc.
+
+**Time:** ~45 minutes from scratch (downloads FFmpeg, VLC contribs)
+
+---
+
+## VLC 4.0 API Gotchas
+
+Things that changed in VLC 4.0 and require workarounds:
+
+| API | Old (VLC 3.x) | New (VLC 4.0) | Fix |
+|---|---|---|---|
+| `vlc_thread_t` | `typedef pthread_t` | Opaque handle | Can't assign `sys->th` to `pthread_t decoder_worker` |
+| `dec->fmt_in.X` | Direct struct access | `dec->fmt_in->X` (pointer) | All fmt_in accesses use `->` |
+| `vlc_clone()` | 4 args (includes priority) | 3 args (no priority) | Remove 4th arg |
+| `vout_window_t` | Window type | `vlc_window_t` | Rename |
+| `i_rmask/i_gmask/i_bmask` | In `video_format_t` | Removed | Don't reference |
+| `typeof()` macro | In `vlc_fixups.h` | Breaks emscripten/val.h | `#undef typeof` before `#include <emscripten/val.h>` |
+| `aout_TimeGetDefault()` | audio time helper | Removed | Return `VLC_EGENERIC` directly |
+| `libvlc_media_player_is_playing()` | Non-blocking read | Acquires `vlc_player_Lock` → `pthread_cond_timedwait` → **blocks main browser thread** → WASM abort | Cache state in `window._vlcIsPlaying`; overlay.js uses cache, NOT WASM call |
+
+---
+
+## Default VLC Options
+
+```
+--codec=webcodec --aout=emworklet --avcodec-threads=1
+```
+
+| Option | Why |
+|---|---|
+| `--codec=webcodec` | Force browser VideoDecoder (hardware H.264) instead of FFmpeg |
+| `--aout=emworklet` | Enable AudioWorklet output module (module shortname: `emworklet`) |
+| `--avcodec-threads=1` | Fallback: if webcodec fails, prevents FFmpeg frame-threading exhausting PTHREAD_POOL_SIZE=25 |
+
+---
 
 ## WASM Function Interface
 
-The JS layer calls WASM via `module._wasm_*()` functions. Key exports:
+The JS layer calls WASM via `module._wasm_*()`. Key exports:
 
-- `_wasm_libvlc_init(argc, argv)` — initialize VLC with options
-- `_wasm_media_player_new()` → pointer
-- `_wasm_media_player_play/pause/stop(ptr)`
-- `_wasm_media_player_get_time/set_time(ptr, ms)`
-- `_wasm_media_player_get_position/set_position(ptr, float)`
-- `_wasm_media_new_location(path_ptr)` → pointer
-- `_wasm_audio_get_volume/set_volume(ptr, int)`
-- `_wasm_audio_toggle_mute(ptr)`
-- `_set_global_media_player(ptr)`
-- `_attach_update_events(ptr)`
+```javascript
+// Initialization
+module._wasm_libvlc_init(argc, argv_ptr)
 
-Emscripten helpers used: `allocateUTF8()`, `_free()`, `_malloc()`, `writeAsciiToMemory()`, `wasmMemory`.
+// Media player
+module._wasm_media_player_new() → ptr
+module._wasm_media_player_play(ptr)
+module._wasm_media_player_set_pause(ptr, do_pause)  // use this, NOT pause()
+module._wasm_media_player_stop(ptr)
+module._wasm_media_player_get_time(ptr) → BigInt (VLC 4.0)
+module._wasm_media_player_set_time(ptr, time_ms, fast)
+module._wasm_media_player_get_position(ptr) → float
+module._wasm_media_player_set_position(ptr, pos, fast)
+module._wasm_media_player_get_length(ptr) → BigInt (VLC 4.0)
+module._wasm_media_player_is_playing(ptr) → int  // DO NOT call from main thread
+
+// Media
+module._wasm_media_new_location(path_ptr) → ptr
+
+// Audio (volume 0-100)
+module._wasm_audio_get_volume(ptr) → int
+module._wasm_audio_set_volume(ptr, vol)
+module._wasm_audio_get_mute(ptr) → bool
+module._wasm_audio_set_mute(ptr, bool)
+
+// Misc
+module._set_global_media_player(ptr)
+module._attach_update_events(ptr)
+```
+
+**VLC 4.0 BigInt returns:** `get_time()` and `get_length()` return `BigInt`. Always wrap in `Number()` before arithmetic: `Number(media_player.get_time())`.
+
+Emscripten helpers: `allocateUTF8()`, `_free()`, `_malloc()`, `writeAsciiToMemory()`, `wasmMemory`, `PThread`.
+
+---
+
+## Testing
+
+```bash
+npm test               # 93 unit tests (Vitest)
+npm run test:browser   # Browser integration test — decodes ≥10 VideoFrames from MXF
+npm run test:watch     # Watch mode
+```
+
+**Test files:**
+- `tests/libvlc.test.js` — 35 tests: MediaPlayer API, all WASM bindings mocked
+- `tests/server.test.js` — 9 tests: server routing, COOP/COEP headers, path traversal
+- `tests/html-structure.test.js` — 17 tests: DOM structure, ARIA, accessibility
+- `tests/mxf-playback.test.js` — 26 tests: VLC options, codec parsing, BigInt handling
+- `tests/mxf-browser-playback.test.js` — 6 tests: real browser, actual decode of Canon MXF
+
+**Test rules:** Tests are ground truth. Never modify tests to make them pass. If a test fails, the source code is wrong.
+
+---
 
 ## Browser Requirements
 
-- SharedArrayBuffer (requires COOP/COEP headers — server.js provides these)
-- WebGL2
-- AudioWorklet
-- ES Modules
-- WASM with threads (pthreads)
-- Chrome/Edge recommended. Firefox needs `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled`.
+- **SharedArrayBuffer** — requires COOP/COEP headers (server.js provides these)
+- **WebCodecs VideoDecoder** — Chrome 94+; `VideoDecoder.decode()`, `VideoFrame`
+- **AudioWorklet** — Chrome 66+; required for audio
+- **WebGL2** — required by VLC's vout (even though WebCodecs bypasses it for rendering)
+- **WASM threads** (pthreads via SharedArrayBuffer)
+- **Chrome/Edge recommended.** Firefox needs `dom.postMessage.sharedArrayBuffer.bypassCOOP_COEP.insecure.enabled=true`.
+
+---
 
 ## Development
 
 ```bash
-npm start              # Start dev server at http://localhost:3000
-npm test               # Run unit tests (Vitest) — 87 tests across 5 files
-npm run test:watch     # Run tests in watch mode
-npm run test:browser   # Run MXF browser playback tests (requires running server)
+npm start              # Dev server at http://localhost:3000
+npm test               # 93 unit tests
+npm run test:browser   # Browser test (server must be running)
 ```
 
-**Default VLC options** (stored in `localStorage`, editable in the UI):
-```
---codec=webcodec --aout=emworklet --avcodec-threads=1
-```
-- `--codec=webcodec` — use browser VideoDecoder for H.264/HEVC
-- `--aout=emworklet` — enable audio via AudioWorklet (was `adummy` in original)
-- `--avcodec-threads=1` — prevents `thread_get_buffer()` failures when falling back to FFmpeg
-
-## Git Workflow
-
-- `main` — current working branch; `dev/js-updates` has been fully merged in. Contains all modernization work including WebCodecs.
-- `dev/js-updates` — merged into `main` (commit `9c2222d`). No longer active.
-- `dev/wasm-rebuild` — for future WASM binary rebuild experiments.
-- Tag `v1.0-working` — permanent reference to the original 2020/2024 distribution state (`ed4128f`).
-
-The "never commit directly to main" rule from the original CLAUDE.md no longer applies — `dev/js-updates` has been merged and `main` is the active branch.
-
-## WASM Build (Docker)
-
-**Current build:** `build/Dockerfile` + `build/compile.sh`
-- **Emscripten SDK 4.0.1**
-- **VLC master** (not the upstream 2022-era `incoming` branch)
-- Build: `docker compose -f build/docker-compose.yml up` → clones VLC master, applies `build/vlc_patches/aug/` patch series, copies `build/webcodec/` plugin source, links with `emcc`
-- Output: `experimental.js` (~364 KB), `experimental.wasm` (31 MB), `experimental.worker.js`
-
-Key Emscripten flags in the link step:
-```
--s USE_PTHREADS=1
--s ALLOW_MEMORY_GROWTH=1        # NEW — required for 4K video
--s TOTAL_MEMORY=2GB
--s PTHREAD_POOL_SIZE=25
--s OFFSCREEN_FRAMEBUFFER=1
--s USE_WEBGL2=1
--s MODULARIZE=1
--s EXPORT_NAME="initModule"
--s ASYNCIFY=1
--s EXPORTED_RUNTIME_METHODS=[...,wasmMemory,PThread]   # NEW — required by JS layer
--s EXPORTED_FUNCTIONS=[...,_malloc,_free]              # NEW — required by JS layer
--O3
+After Docker rebuild, re-apply JS patches to experimental.js:
+```python
+# See the patch application script pattern in prior sessions
+# Patches: VideoDecoder avc3.7a0033, probeConfig, globalThis.Module,
+#          bindVideoFrame, boundOutputCb null guard
 ```
 
-The webcodec plugin Makefile.am must include `-s ASYNCIFY=1` in `libwebcodec_plugin_la_LDFLAGS` — without it, the `EM_ASYNC_JS` calls in `webcodec.cpp` and `interop_emscripten.cpp` fail silently.
+---
 
-**Upstream build (archived):** The original upstream used Emscripten 3.1.18 + Docker image `registry.videolan.org/vlc-debian-wasm-emscripten:20220505193036`. No longer used.
+## Git History
 
-## Known Bugs — Status
+- `main` — active branch; all work merged here
+- `v1.0-working` — tag for original 2020 distribution (`ed4128f`); use as reference
+- `9c2222d` — WebCodecs H.264 video playback working
+- `48495ef` — Audio output working (emworklet + AudioWorklet)
 
-All four original bugs are **fixed** (merged to `main`):
-
-1. `lib/libvlc.js:239` — ~~template literal missing `$`~~ — **FIXED**
-2. `lib/module-loader.js:10,13` — ~~duplicate `var was_clicked`~~ — **FIXED** (entire file rewritten as ES module)
-3. `server.js:21` — ~~no path traversal protection~~ — **FIXED** (resolves path, checks `startsWith(ROOT)`)
-4. `vlc.html:45` — ~~inline `oncontextmenu`~~ — **FIXED** (moved to `addEventListener` in `main.js`)
-
-## Changes from v1.0 (`ed4128f` / tag `v1.0-working`)
-
-Summary of every significant change made after the initial commit:
-
-| Area | Change |
-|---|---|
-| **WASM binary** | Rebuilt from VLC 4.0 master + Emscripten 4.0.1 (was: VLC 3.x, Emscripten 3.1.18). Size: 27 MB → 31 MB. |
-| **webcodec plugin** | Compiled into WASM. New files: `build/webcodec/{webcodec.cpp,interop_emscripten.cpp,common.h}`. |
-| **`main.js`** | New file. All inline `<script>` logic from `vlc.html` extracted here. ES module. |
-| **`vlc.html`** | Stripped from 352 → 114 lines. Inline scripts removed. ARIA attributes added. |
-| **`vlc.css`** | Responsive layout + dark mode. Removed hardcoded 1280×720. |
-| **`lib/module-loader.js`** | Fully rewritten (75 → 186 lines). Adds: VideoDecoder polyfill for bare `avc1`, direct canvas rendering for WebCodecs frames, proper ES module exports. |
-| **`lib/libvlc.js`** | Template literal bug fixed. VLC 4.0 BigInt return values handled. |
-| **`lib/overlay.js`** | Minor fixes; ARIA improvements. |
-| **`audio-worklet-processor.js`** | Rewritten to use SAB + Atomics protocol matching VLC's C++ audio module (was: broken `type:'audio'` message protocol). |
-| **`server.js`** | Path traversal protection added. Serves `main.js` and new asset types. |
-| **`package.json`** | Added `vitest`, `jsdom`, `playwright-core` devDependencies. Added `test`, `test:watch`, `test:browser` scripts. Node requirement: 14 → 18. |
-| **`build/`** | New directory: `Dockerfile`, `compile.sh`, `docker-compose.yml`, `patch_vlcjs_wrappers.sh`, `create_main.sh`, 80+ VLC patch files. |
-| **`tests/`** | New directory: 5 test files, 87 tests (libvlc, server, html-structure, mxf-playback, mxf-browser-playback). |
-| **`vitest.config.js`** | New file. |
-| **`.github/workflows/test.yml`** | New CI pipeline running `npm test` on push. |
-| **`experimental.js`** | Regenerated for VLC 4.0 / Emscripten 4.0.1. `wasmMemory`, `PThread`, `_malloc`, `_free` now exported. `ALLOW_MEMORY_GROWTH=1` enabled. |
+---
 
 ## AI Agent Team Structure
 
-When this project requires multi-step investigation and implementation, spawn a team using these roles. Each maps to a Claude Code agent type.
+Spawn teams for complex multi-step work:
 
 | Role | Agent Type | Responsibilities |
 |---|---|---|
-| **forensics** | `Explore` (read-only) | Deep code analysis — API compatibility, git history diffs, build script auditing, finding silent failures. Returns findings; does NOT edit files. |
-| **js-fixer** | `general-purpose` | JS/HTML/CSS/build-script edits. Implements fixes from forensics findings. Runs `npm test` after every change. |
-| **test-engineer** | `general-purpose` | Writes new tests in `tests/`. Never modifies existing test files. Verifies full test suite passes after additions. |
-| **overseer** | `general-purpose` | Final QA pass. Runs `npm test`, checks `git diff`, validates CLAUDE.md known-bug list, reviews test quality, writes summary report. Spawned last, blocked on js-fixer + test-engineer completing. |
+| **forensics** | `Explore` (read-only) | Deep code analysis, API diffs, build auditing |
+| **js-fixer** | `general-purpose` | JS/CSS/build edits; runs `npm test` after each change |
+| **test-engineer** | `general-purpose` | Writes new tests; never modifies existing test files |
+| **overseer** | `general-purpose` | Final QA: runs tests, checks git diff, writes report |
 
-### Team spin-up pattern
-```
-TeamCreate → TaskCreate (one per role) → Task (spawn agents with team_name) → wait for messages → TaskUpdate(completed) → TeamDelete
-```
+Spin-up: `TeamCreate → TaskCreate → Task (agents) → wait → TeamDelete`
+Set overseer task `addBlockedBy` on js-fixer + test-engineer IDs.
 
-Set the overseer task `addBlockedBy` on js-fixer and test-engineer task IDs so it only runs after both complete.
+---
 
 ## Rules for AI/LLM Assistants
 
 **Tests are ground truth. Do not modify tests to make them pass.**
 
 - If a test fails, the *source code* is wrong, not the test.
-- Never weaken assertions, delete test cases, change expected values, or add conditionals to skip failures.
-- Never mark a failing test as "expected to fail" or wrap it in `try/catch` to suppress errors.
-- If you believe a test is genuinely incorrect, explain why and ask the human to confirm before touching it.
+- Never weaken assertions, delete test cases, change expected values, or skip failures.
+- If a test is genuinely wrong, explain why and ask the human to confirm before touching it.
 - All changes must pass `npm test` before being committed.
-- Do not edit files in `tests/` unless the human explicitly asks you to add new test cases or the test file itself has a syntax error.
-
-## Modernization Goals — Status
-
-1. **WebCodecs playback** — ✅ **DONE** — WASM rebuilt with webcodec plugin; H.264/MXF plays via browser `VideoDecoder`. Direct canvas rendering via `ctx.drawImage(frame)` in `module-loader.js`.
-2. **Security** — ✅ path traversal fixed, inline handlers removed, CSP readiness
-3. **Accessibility** — ✅ ARIA labels, keyboard navigation; further improvements welcome
-4. **Responsive design** — ✅ dark mode, responsive layout (removed hardcoded 1280x720)
-5. **Code quality** — ✅ strict equality, extracted inline scripts to `main.js`, modern ES modules
-6. **Testing** — ✅ 87 unit tests across 5 files (Vitest); covers libvlc API, server, HTML structure, MXF playback
-7. **Build pipeline** — ✅ Dockerized WASM build with Emscripten 4.0.1 + VLC master
-8. **CI/CD** — ✅ GitHub Actions workflow at `.github/workflows/test.yml`
+- Do not edit `tests/` unless explicitly asked to add new test cases.
