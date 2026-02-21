@@ -326,6 +326,17 @@ static int Decode( decoder_t* dec, vlc_frame_t* block )
 static void Flush( decoder_t* dec )
 {
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
+    // emscripten::val objects have thread affinity — they must be used from
+    // the thread that created them. WebcodecDecodeWorker creates sys->decoder
+    // (the JS VideoDecoder emval) on the decoder pthread. Calling flush()
+    // from a different thread (e.g. VLC's input thread) triggers the
+    // "val accessed from wrong thread" assertion in Emscripten 4.0.1.
+    // Guard: only call flush if we're on the decoder thread.
+    if ( sys->th != 0 && !pthread_equal( sys->th, pthread_self() ) )
+    {
+        msg_Warn( dec, "webcodec Flush: skipping flush (wrong thread)" );
+        return;
+    }
     sys->decoder.call<emval>("flush").await();
 }
 

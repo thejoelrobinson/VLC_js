@@ -281,12 +281,12 @@ function createHandlers() {
     const step = e.shiftKey ? 0.1 : 0.02; // Shift = 10%, normal = 2%
     if (e.key === 'ArrowRight') {
       e.preventDefault();
-      const pos = Math.min(1, Number(media_player.get_position()) + step);
+      const pos = Math.min(1, (window._vlcStateCache?.position ?? 0) + step);
       media_player.set_position(pos);
       update_overlay();
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
-      const pos = Math.max(0, Number(media_player.get_position()) - step);
+      const pos = Math.max(0, (window._vlcStateCache?.position ?? 0) - step);
       media_player.set_position(pos);
       update_overlay();
     }
@@ -298,13 +298,13 @@ function createHandlers() {
     const step = e.shiftKey ? 20 : 5;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const vol = Math.min(100, Number(media_player.get_volume()) + step);
+      const vol = Math.min(100, (window._vlcStateCache?.volume ?? 80) + step);
       media_player.set_volume(vol);
       media_player.set_mute(0);
       update_overlay();
     } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
       e.preventDefault();
-      const vol = Math.max(0, Number(media_player.get_volume()) - step);
+      const vol = Math.max(0, (window._vlcStateCache?.volume ?? 80) - step);
       media_player.set_volume(vol);
       update_overlay();
     }
