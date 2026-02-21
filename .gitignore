@@ -1,3 +1,13 @@
 node_modules/
 .DS_Store
 *.log
+# Test media files (large binaries)
+*.MXF
+*.mxf
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
