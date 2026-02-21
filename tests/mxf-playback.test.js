@@ -10,11 +10,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // The default VLC options string as defined in main.js (lines 33, 37).
 // We define it here because main.js cannot be imported directly (browser APIs).
-// NOTE: --aout=adummy is used because the VLC 4.0 WASM build (via VLC's
-// extras/package/wasm-emscripten/build.sh) does not include emworklet_audio.
-// adummy = null audio output (silent video). Full audio requires a future
-// rebuild that includes the emscripten_audio_worklet module.
-const DEFAULT_OPTIONS = '--codec=webcodec --aout=adummy --avcodec-threads=1';
+// NOTE: --aout=emworklet uses the Emscripten AudioWorklet-based audio output
+// module (emworklet_audio) which bridges VLC's audio decoder to Web Audio API
+// via SharedArrayBuffer/Atomics for low-latency playback.
+const DEFAULT_OPTIONS = '--codec=webcodec --aout=emworklet --avcodec-threads=1';
 
 function createMockModule() {
   return {
@@ -63,8 +62,8 @@ describe('Default VLC options for MXF playback', () => {
     expect(DEFAULT_OPTIONS).toContain('--codec=webcodec');
   });
 
-  it('should contain --aout=adummy (null audio; emworklet_audio not in VLC 4.0 build)', () => {
-    expect(DEFAULT_OPTIONS).toContain('--aout=adummy');
+  it('should contain --aout=emworklet (AudioWorklet-based audio output)', () => {
+    expect(DEFAULT_OPTIONS).toContain('--aout=emworklet');
   });
 
   it('should contain --avcodec-threads=1 to prevent thread_get_buffer exhaustion', () => {
@@ -108,7 +107,7 @@ describe('VLC option argv construction', () => {
     const { vlc_opts_array } = parseVlcOptions(DEFAULT_OPTIONS);
     expect(vlc_opts_array).toEqual([
       '--codec=webcodec',
-      '--aout=adummy',
+      '--aout=emworklet',
       '--avcodec-threads=1',
     ]);
   });
@@ -116,10 +115,10 @@ describe('VLC option argv construction', () => {
   it('should compute correct buffer size (each string length + 1 null terminator)', () => {
     const { vlc_opts_size } = parseVlcOptions(DEFAULT_OPTIONS);
     // '--codec=webcodec' = 16 + 1 = 17
-    // '--aout=adummy' = 13 + 1 = 14
+    // '--aout=emworklet' = 16 + 1 = 17
     // '--avcodec-threads=1' = 19 + 1 = 20
-    // Total: 17 + 14 + 20 = 51
-    expect(vlc_opts_size).toBe(51);
+    // Total: 17 + 17 + 20 = 54
+    expect(vlc_opts_size).toBe(54);
   });
 
   it('should handle a single option', () => {
@@ -153,8 +152,8 @@ describe('VLC option argv construction', () => {
       offsets.push(wrote_size);
       wrote_size += vlc_opts_array[i].length + 1;
     }
-    // '--codec=webcodec' ends at 17, '--aout=adummy' ends at 17+14=31
-    expect(offsets).toEqual([0, 17, 31]);
+    // '--codec=webcodec' ends at 17, '--aout=emworklet' ends at 17+17=34
+    expect(offsets).toEqual([0, 17, 34]);
   });
 });
 
@@ -286,10 +285,10 @@ describe('Module-loader canvas configuration', () => {
 // 6. Audio output configuration
 // ===================================================================
 describe('Audio output configuration for WASM', () => {
-  it('default options use adummy (null audio output; emworklet_audio not in this build)', () => {
+  it('default options use emworklet (AudioWorklet-based audio output)', () => {
     const opts = DEFAULT_OPTIONS.split(' ');
     const aoutOption = opts.find(o => o.startsWith('--aout='));
-    expect(aoutOption).toBe('--aout=adummy');
+    expect(aoutOption).toBe('--aout=emworklet');
   });
 
   it('audio option is not combined with --no-audio', () => {

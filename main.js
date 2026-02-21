@@ -30,11 +30,11 @@ async function init() {
   });
 
   resetBtn.addEventListener('click', () => {
-    localStorage.setItem('options', '--codec=webcodec --aout=adummy --avcodec-threads=1');
+    localStorage.setItem('options', '--codec=webcodec --aout=emworklet --avcodec-threads=1');
     reloadBtn.click();
   });
 
-  options.value = localStorage.getItem('options') || '--codec=webcodec --aout=adummy --avcodec-threads=1';
+  options.value = localStorage.getItem('options') || '--codec=webcodec --aout=emworklet --avcodec-threads=1';
 
   options.addEventListener('change', () => {
     localStorage.setItem('options', options.value);

@@ -175,6 +175,48 @@ if [ ! -d vlc ]; then
         diagnostic "No webcodec/ directory found — skipping WebCodec injection"
     fi
 
+    # ---- Step 3c: Inject audio worklet sources (bypasses git am for VLC 4.0 compat) ----
+    # Patch 0079 replaces emscripten.cpp with emscripten.c + webaudio/ subdirectory.
+    # VLC 4.0 may have a different version; inject directly like webcodec.
+    if [ -d ../audio ]; then
+        diagnostic "Injecting audio worklet sources into VLC tree..."
+
+        # Replace the audio output C source with the patched version
+        cp ../audio/emscripten.c modules/audio_output/emscripten.c
+        # Remove old C++ version if it exists
+        rm -f modules/audio_output/emscripten.cpp
+
+        # Create webaudio subdirectory and inject files
+        mkdir -p modules/audio_output/webaudio
+        cp ../audio/webaudio.c modules/audio_output/webaudio/webaudio.c
+        cp ../audio/webaudio.h modules/audio_output/webaudio/webaudio.h
+        cp ../audio/audio-worklet-processor.js modules/audio_output/webaudio/audio-worklet-processor.js
+
+        # Update Makefile.am: replace old cpp reference if present, otherwise append fresh entry
+        if grep -q 'audio_output/emscripten.cpp' modules/audio_output/Makefile.am; then
+            sed -i 's|audio_output/emscripten.cpp|audio_output/emscripten.c audio_output/webaudio/webaudio.c audio_output/webaudio/webaudio.h|' modules/audio_output/Makefile.am
+            diagnostic "  Updated emscripten.cpp -> emscripten.c in Makefile.am"
+        elif grep -q 'libemworklet_audio_plugin_la_SOURCES' modules/audio_output/Makefile.am; then
+            # Entry exists — update the source list in place
+            sed -i 's|libemworklet_audio_plugin_la_SOURCES = .*|libemworklet_audio_plugin_la_SOURCES = audio_output/emscripten.c audio_output/webaudio/webaudio.c audio_output/webaudio/webaudio.h|' modules/audio_output/Makefile.am
+            diagnostic "  Updated existing libemworklet_audio_plugin_la_SOURCES in Makefile.am"
+        else
+            # No existing entry — append fresh entries
+            printf '\nlibemworklet_audio_plugin_la_SOURCES = audio_output/emscripten.c audio_output/webaudio/webaudio.c audio_output/webaudio/webaudio.h\n' >> modules/audio_output/Makefile.am
+            printf 'libemworklet_audio_plugin_la_CFLAGS = $(AM_CFLAGS)\n' >> modules/audio_output/Makefile.am
+            printf 'if HAVE_EMSCRIPTEN\naout_LTLIBRARIES += libemworklet_audio_plugin.la\nendif\n' >> modules/audio_output/Makefile.am
+            diagnostic "  Appended fresh libemworklet_audio_plugin entries to Makefile.am"
+        fi
+        if ! grep -q 'libemworklet_audio_plugin' modules/audio_output/Makefile.am; then
+            diagnostic "ERROR: Failed to register libemworklet_audio_plugin in Makefile.am"
+            exit 1
+        fi
+
+        diagnostic "  audio/emscripten.c, webaudio.c, webaudio.h, audio-worklet-processor.js injected"
+    else
+        diagnostic "No audio/ directory found — skipping audio worklet injection"
+    fi
+
     cd "${WORK_DIR}"
 else
     diagnostic "VLC source directory already exists, skipping clone"

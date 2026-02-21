@@ -65,6 +65,9 @@ diagnostic "  emcc: $(which emcc)"
 
 # Locate the webaudio.js library (path varies between VLC versions)
 WEBAUDIO_JS=$(find "${PATH_VLC}" -name "webaudio.js" -path "*/audio_output/*" 2>/dev/null | head -1)
+if [ -z "${WEBAUDIO_JS}" ] && [ -f "js-libs/webaudio.js" ]; then
+    WEBAUDIO_JS="js-libs/webaudio.js"
+fi
 if [ -z "${WEBAUDIO_JS}" ] && [ -f "vlcjs-upstream/lib/webaudio.js" ]; then
     WEBAUDIO_JS="vlcjs-upstream/lib/webaudio.js"
 fi
