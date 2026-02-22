@@ -128,6 +128,7 @@ emcc --bind \
     "${PATH_VLC}/build-emscripten/src/.libs/libvlccore.a" \
     "${PATH_VLC}/build-emscripten/compat/.libs/libcompat.a" \
     --pre-js js-patches/videodecoder-deferred-configure.js \
+    --pre-js js-patches/cancel-main-loop.js \
     --js-library js-libs/wasm-imports.js \
     ${WEBAUDIO_LIB} \
     -o experimental.js

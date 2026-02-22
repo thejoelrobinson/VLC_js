@@ -93,4 +93,11 @@ if [ -f "${FILE_MEDIA}" ]; then
     grep -n 'libvlc_media_new_path\|libvlc_media_new_location' "${FILE_MEDIA}" || true
 fi
 
+# ---- main.c ----
+# The iter() deadlock (iter calls libvlc_media_player_get_time which acquires
+# vlc_player_Lock on the main browser thread) is now fixed at the JavaScript
+# level via --pre-js build/js-patches/cancel-main-loop.js, which cancels the
+# Emscripten main loop via factory-scope closure access after VLC initializes.
+# No C-level patch to main.c is needed.
+
 diagnostic "All patches applied successfully."

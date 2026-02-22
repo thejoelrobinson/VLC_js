@@ -1,6 +1,6 @@
 import { update_overlay, on_overlay_click } from "./lib/overlay.js";
 import { MediaPlayer } from "./lib/libvlc.js";
-import { isOPFSSupported, getCachedOPFSFile, copyFileToOPFS } from "./lib/opfs.js";
+import { isOPFSSupported, getCachedOPFSFile } from "./lib/opfs.js";
 
 let vlc_options = "";
 
@@ -151,31 +151,20 @@ function createHandlers(): void {
     if (this.files && this.files.length) {
       body.dispatchEvent(showCanvas);
 
-      // OPFS: copy file to browser storage for faster seeking
+      // OPFS: use a previously cached copy for faster seeking if one exists.
+      // Background copying during playback is deliberately avoided — writing
+      // to OPFS while VLC is active interferes with Emscripten's ASYNCIFY
+      // event dispatch at end-of-stream and causes a permanent page freeze.
+      // Files are cached passively: the next time the same file is selected
+      // after a previous session cached it, the fast OPFS-backed File is used.
       const originalFile = this.files.item(0)!;
       if (isOPFSSupported()) {
         getCachedOPFSFile(originalFile).then((cached) => {
           if (cached) {
-            console.log("OPFS: using cached file");
+            console.log("OPFS: using cached file for faster seeking");
             window.Module['vlc_access_file'][1] = cached;
-          } else {
-            // Start background copy — playback uses original file until done.
-            // Report progress only at 10% intervals to avoid flooding the
-            // event loop with setStatus dispatches.
-            let lastReported = -1;
-            copyFileToOPFS(originalFile, (pct) => {
-              const bucket = Math.floor(pct / 10) * 10;
-              if (bucket !== lastReported) {
-                lastReported = bucket;
-                console.log(`OPFS: caching ${pct}%`);
-              }
-            }).then((opfsFile) => {
-              if (opfsFile) {
-                console.log("OPFS: file cached, switching to OPFS-backed file");
-                window.Module['vlc_access_file'][1] = opfsFile;
-              }
-            });
           }
+          // No background copy — avoids event-loop interference during playback.
         });
       }
     } else {
@@ -228,6 +217,40 @@ function createHandlers(): void {
 
   update_overlay();
 
+  // RAF loop: drive progress bar and UI state at ~4 Hz.
+  // Also detects natural video end: if timeMs stops advancing while _vlcIsPlaying
+  // is true, the video ended. Reset _vlcIsPlaying so UI shows play icon and
+  // VLC WASM calls (pause/stop) are not triggered by future button clicks.
+  let _lastUIUpdate = 0;
+  let _lastTimeMs = -1;
+  let _staleCount = 0;
+  function _uiLoop(): void {
+    const now = performance.now();
+    if (now - _lastUIUpdate >= 250) {
+      update_overlay();
+      _lastUIUpdate = now;
+
+      // Detect natural video end: timeMs stopped advancing while playing.
+      // After ~1.5s of no change, mark as no longer playing to prevent
+      // VLC WASM lock calls at EOS (which cause ASYNCIFY deadlock).
+      if (window._vlcIsPlaying && window._vlcStateCache) {
+        const currentTimeMs = window._vlcStateCache.timeMs;
+        if (currentTimeMs > 0 && currentTimeMs === _lastTimeMs) {
+          _staleCount++;
+          if (_staleCount >= 6) { // ~1.5s of stale time
+            window._vlcIsPlaying = false;
+            _staleCount = 0;
+          }
+        } else {
+          _lastTimeMs = currentTimeMs;
+          _staleCount = 0;
+        }
+      }
+    }
+    requestAnimationFrame(_uiLoop);
+  }
+  requestAnimationFrame(_uiLoop);
+
   const playButton = document.getElementById('play-button')!;
   const bPlayButton = document.getElementById('bottom-play-button')!;
 
@@ -239,7 +262,11 @@ function createHandlers(): void {
   function handlePlayPause(): void {
     if (window.files) {
       if (window._vlcIsPlaying) {
-        media_player.pause();
+        // Use set_pause(1) NOT pause(). pause() triggers an audio drain that
+        // calls emscripten_futex_wait() on the audio thread AND acquires
+        // vlc_player_Lock on the main browser thread via ASYNCIFY — deadlock.
+        // set_pause(1) sends a pause command without the blocking drain wait.
+        media_player.set_pause(1);
         window._vlcIsPlaying = false;
       } else {
         media_player.play();
@@ -311,12 +338,15 @@ function createHandlers(): void {
     const step = e.shiftKey ? 0.1 : 0.02; // Shift = 10%, normal = 2%
     if (e.key === 'ArrowRight') {
       e.preventDefault();
-      const pos = Math.min(1, Number(media_player.get_position()) + step);
+      // Use _vlcStateCache.position NOT media_player.get_position().
+      // get_position() acquires vlc_player_Lock → pthread_cond_timedwait →
+      // blocks the main browser thread via ASYNCIFY → page freeze.
+      const pos = Math.min(1, (window._vlcStateCache?.position ?? 0) + step);
       media_player.set_position(pos);
       update_overlay();
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
-      const pos = Math.max(0, Number(media_player.get_position()) - step);
+      const pos = Math.max(0, (window._vlcStateCache?.position ?? 0) - step);
       media_player.set_position(pos);
       update_overlay();
     }
@@ -328,13 +358,14 @@ function createHandlers(): void {
     const step = e.shiftKey ? 20 : 5;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const vol = Math.min(100, Number(media_player.get_volume()) + step);
+      // Use _vlcStateCache.volume NOT media_player.get_volume() for same reason.
+      const vol = Math.min(100, (window._vlcStateCache?.volume ?? 80) + step);
       media_player.set_volume(vol);
       media_player.set_mute(0);
       update_overlay();
     } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
       e.preventDefault();
-      const vol = Math.max(0, Number(media_player.get_volume()) - step);
+      const vol = Math.max(0, (window._vlcStateCache?.volume ?? 80) - step);
       media_player.set_volume(vol);
       update_overlay();
     }
