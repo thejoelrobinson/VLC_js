@@ -318,6 +318,10 @@ function createHandlers(): void {
     _staleCount = 0;
     update_overlay();
 
+    // Skip the actual VLC seek if the WASM state is corrupted.
+    // Cache/overlay are already updated above for visual feedback.
+    if (window._vlcException) return;
+
     // Debounce the actual VLC seek command (set_position acquires
     // vlc_player_Lock). Rapid scrubbing would spam the lock and risk
     // ASYNCIFY deadlock. Only send the command after 150ms of inactivity.
@@ -339,11 +343,8 @@ function createHandlers(): void {
   function handlePlayPause(): void {
     if (window.files) {
       if (window._vlcIsPlaying) {
-        // Use set_pause(1) NOT pause(). pause() triggers an audio drain that
-        // calls emscripten_futex_wait() on the audio thread AND acquires
-        // vlc_player_Lock on the main browser thread via ASYNCIFY — deadlock.
-        // set_pause(1) sends a pause command without the blocking drain wait.
-        media_player.set_pause(1);
+        // set_pause(1) instead of pause() — avoids audio drain deadlock.
+        if (!window._vlcException) media_player.set_pause(1);
         window._vlcIsPlaying = false;
       } else {
         // If VLC threw a WASM exception, its internal state is corrupted and
@@ -378,7 +379,7 @@ function createHandlers(): void {
 
   const volumeSvgWrapper = document.getElementById('volume-svg-wrapper')!;
   volumeSvgWrapper.addEventListener('click', function(): void {
-    if (!window.files || !window.files.length) return;
+    if (!window.files || !window.files.length || window._vlcException) return;
     media_player.toggle_mute();
     update_overlay();
   });
@@ -391,7 +392,7 @@ function createHandlers(): void {
 
   const progressVolumeTotal = document.getElementById('bottom-progress-volume')!;
   progressVolumeTotal.addEventListener('click', function(event: MouseEvent): void {
-    if (!window.files || !window.files.length) return;
+    if (!window.files || !window.files.length || window._vlcException) return;
     media_player.set_volume(event.offsetX / progressVolumeTotal.clientWidth * 100);
     media_player.set_mute(0);
     update_overlay();
@@ -399,14 +400,14 @@ function createHandlers(): void {
 
   const nextChapterBtn = document.getElementById('next-chapter')!;
   nextChapterBtn.addEventListener('click', () => {
-    if (!window.files || !window.files.length) return;
+    if (!window.files || !window.files.length || window._vlcException) return;
     window.media_player?.next_chapter();
     update_overlay();
   });
 
   const previousChapterBtn = document.getElementById('previous-chapter')!;
   previousChapterBtn.addEventListener('click', () => {
-    if (!window.files || !window.files.length) return;
+    if (!window.files || !window.files.length || window._vlcException) return;
     window.media_player?.previous_chapter();
     update_overlay();
   });
@@ -442,7 +443,7 @@ function createHandlers(): void {
 
   // Keyboard accessibility: volume control with arrow keys
   progressVolumeTotal.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (!window.files || !window.files.length) return;
+    if (!window.files || !window.files.length || window._vlcException) return;
     const step = e.shiftKey ? 20 : 5;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
