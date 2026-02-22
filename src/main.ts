@@ -1,5 +1,6 @@
 import { update_overlay, on_overlay_click } from "./lib/overlay.js";
 import { MediaPlayer } from "./lib/libvlc.js";
+import { isOPFSSupported, getCachedOPFSFile, copyFileToOPFS } from "./lib/opfs.js";
 
 let vlc_options = "";
 
@@ -149,6 +150,34 @@ function createHandlers(): void {
 
     if (this.files && this.files.length) {
       body.dispatchEvent(showCanvas);
+
+      // OPFS: copy file to browser storage for faster seeking
+      const originalFile = this.files.item(0)!;
+      if (isOPFSSupported()) {
+        getCachedOPFSFile(originalFile).then((cached) => {
+          if (cached) {
+            console.log("OPFS: using cached file");
+            window.Module['vlc_access_file'][1] = cached;
+          } else {
+            // Start background copy — playback uses original file until done.
+            // Report progress only at 10% intervals to avoid flooding the
+            // event loop with setStatus dispatches.
+            let lastReported = -1;
+            copyFileToOPFS(originalFile, (pct) => {
+              const bucket = Math.floor(pct / 10) * 10;
+              if (bucket !== lastReported) {
+                lastReported = bucket;
+                console.log(`OPFS: caching ${pct}%`);
+              }
+            }).then((opfsFile) => {
+              if (opfsFile) {
+                console.log("OPFS: file cached, switching to OPFS-backed file");
+                window.Module['vlc_access_file'][1] = opfsFile;
+              }
+            });
+          }
+        });
+      }
     } else {
       body.dispatchEvent(hideCanvas);
     }
