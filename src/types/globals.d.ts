@@ -144,6 +144,9 @@ declare global {
     _vlcIsPlaying: boolean;
     // Cached VLC state for overlay UI (position, time, volume, etc.)
     _vlcStateCache?: VlcStateCache;
+    // Set by _applySeek to the target timeMs; clears when sought frames arrive.
+    // Prevents pre-seek frames from overwriting the immediate playhead feedback.
+    _vlcPendingSeekMs?: number;
     // WebCodecs frame callbacks (set by module-loader.ts)
     _vlcOnDecoderFrame: (pictureId: number, frame: VideoFrame) => void;
     _vlcSetRenderPort1: (port: MessagePort) => void;

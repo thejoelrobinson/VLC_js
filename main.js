@@ -186,20 +186,40 @@ function createHandlers() {
     window.update_overlay = update_overlay;
     update_overlay();
     // RAF loop: drive progress bar and UI state at ~4 Hz.
-    // Also detects natural video end: if timeMs stops advancing while _vlcIsPlaying
-    // is true, the video ended. Reset _vlcIsPlaying so UI shows play icon and
-    // VLC WASM calls (pause/stop) are not triggered by future button clicks.
+    // Also:
+    //  - polls get_length() every ~2s until video duration is known
+    //  - detects natural video end (timeMs stops advancing) to reset _vlcIsPlaying
     let _lastUIUpdate = 0;
     let _lastTimeMs = -1;
     let _staleCount = 0;
+    let _lengthPollTick = 0; // counts 250ms ticks; poll every 8 = ~2s
+    let _lengthKnown = false; // stop polling once we have a valid length
     function _uiLoop() {
         const now = performance.now();
         if (now - _lastUIUpdate >= 250) {
             update_overlay();
             _lastUIUpdate = now;
-            // Detect natural video end: timeMs stopped advancing while playing.
-            // After ~1.5s of no change, mark as no longer playing to prevent
-            // VLC WASM lock calls at EOS (which cause ASYNCIFY deadlock).
+            _lengthPollTick++;
+            // ── Duration polling ────────────────────────────────────────────────
+            // get_length() reads a cached value from VLC's player struct (no
+            // pthread_cond_timedwait, unlike get_time/get_position). Safe to call
+            // from the main thread once VLC has parsed the container (~1–5s).
+            // Poll every ~2s until we get a valid value, then stop.
+            if (!_lengthKnown && window._vlcIsPlaying &&
+                window._vlcStateCache && _lengthPollTick % 8 === 0) {
+                try {
+                    const len = Number(media_player.get_length());
+                    if (len > 0) {
+                        window._vlcStateCache.lengthMs = len;
+                        _lengthKnown = true;
+                    }
+                }
+                catch (e) { /* lock contended — retry next cycle */ }
+            }
+            // ── End-of-stream detection ──────────────────────────────────────────
+            // timeMs stopped advancing → video ended naturally.
+            // Reset _vlcIsPlaying to prevent blocking VLC WASM calls from button
+            // clicks after EOS (they would ASYNCIFY-deadlock on vlc_player_Lock).
             if (window._vlcIsPlaying && window._vlcStateCache) {
                 const currentTimeMs = window._vlcStateCache.timeMs;
                 if (currentTimeMs > 0 && currentTimeMs === _lastTimeMs) {
@@ -218,6 +238,25 @@ function createHandlers() {
         requestAnimationFrame(_uiLoop);
     }
     requestAnimationFrame(_uiLoop);
+    // Helper: immediately write a new position to the cache so the playhead
+    // moves the instant the user seeks, without waiting for the next frame.
+    function _applySeek(newPos) {
+        media_player.set_position(newPos);
+        const cache = window._vlcStateCache;
+        if (cache) {
+            cache.position = newPos;
+            if (cache.lengthMs > 0) {
+                cache.timeMs = Math.round(newPos * cache.lengthMs);
+                // Tell the frame handler to ignore pre-seek frames so they don't
+                // overwrite this immediate playhead feedback before new frames arrive.
+                window._vlcPendingSeekMs = cache.timeMs;
+            }
+        }
+        // Reset stale detection so a seek near the end doesn't falsely trigger EOS.
+        _lastTimeMs = -1;
+        _staleCount = 0;
+        update_overlay();
+    }
     const playButton = document.getElementById('play-button');
     const bPlayButton = document.getElementById('bottom-play-button');
     // Track playing state in window._vlcIsPlaying to avoid calling
@@ -256,8 +295,7 @@ function createHandlers() {
     progressTotal.addEventListener('click', function (event) {
         if (!window.files || !window.files.length)
             return;
-        media_player.set_position(event.offsetX / progressTotal.clientWidth);
-        update_overlay();
+        _applySeek(event.offsetX / progressTotal.clientWidth);
     });
     const progressVolumeTotal = document.getElementById('bottom-progress-volume');
     progressVolumeTotal.addEventListener('click', function (event) {
@@ -302,18 +340,11 @@ function createHandlers() {
         const step = e.shiftKey ? 0.1 : 0.02; // Shift = 10%, normal = 2%
         if (e.key === 'ArrowRight') {
             e.preventDefault();
-            // Use _vlcStateCache.position NOT media_player.get_position().
-            // get_position() acquires vlc_player_Lock → pthread_cond_timedwait →
-            // blocks the main browser thread via ASYNCIFY → page freeze.
-            const pos = Math.min(1, (window._vlcStateCache?.position ?? 0) + step);
-            media_player.set_position(pos);
-            update_overlay();
+            _applySeek(Math.min(1, (window._vlcStateCache?.position ?? 0) + step));
         }
         else if (e.key === 'ArrowLeft') {
             e.preventDefault();
-            const pos = Math.max(0, (window._vlcStateCache?.position ?? 0) - step);
-            media_player.set_position(pos);
-            update_overlay();
+            _applySeek(Math.max(0, (window._vlcStateCache?.position ?? 0) - step));
         }
     });
     // Keyboard accessibility: volume control with arrow keys
