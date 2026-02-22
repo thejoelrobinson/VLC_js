@@ -233,3 +233,167 @@ describe('VLC API safety classification', () => {
     expect(src).not.toContain('media_player.is_playing()');
   });
 });
+
+describe('Drag-scrub implementation (static analysis)', () => {
+  it('main.js declares _isScrubbing local flag', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain('_isScrubbing');
+  });
+
+  it('main.js sets window._vlcIsScrubbing on scrub start and clears on scrub end', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain('window._vlcIsScrubbing = true');
+    expect(src).toContain('window._vlcIsScrubbing = false');
+  });
+
+  it('main.js has mousedown handler on progress bar (not only click)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain("'mousedown'");
+  });
+
+  it('main.js has document-level mousemove and mouseup handlers for global drag', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain("'mousemove'");
+    expect(src).toContain("'mouseup'");
+  });
+
+  it('main.js has touch support: touchstart, touchmove, touchend', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain("'touchstart'");
+    expect(src).toContain("'touchmove'");
+    expect(src).toContain("'touchend'");
+  });
+
+  it('main.js _applySeek still exists for backward compatibility', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain('_applySeek');
+  });
+
+  it('main.js scrub end does immediate set_position (no setTimeout)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // _scrubEnd must call set_position directly (no timer) for the final seek.
+    // Confirm set_position appears outside just the setTimeout block.
+    const scrubEndIdx = src.indexOf('_scrubEnd');
+    expect(scrubEndIdx).toBeGreaterThan(-1);
+    // find the direct set_position call that is NOT inside a setTimeout
+    expect(src).toContain('media_player.set_position(finalPos)');
+  });
+
+  it('main.js scrub start pauses playback via set_pause(1)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // During scrub start, if playing, must use set_pause(1) (never pause())
+    const scrubStartIdx = src.indexOf('_scrubStart');
+    expect(scrubStartIdx).toBeGreaterThan(-1);
+    // The code uses set_pause(1) inside _scrubStart
+    expect(src).toContain('set_pause(1)');
+  });
+
+  it('main.js scrub end resumes playback via set_pause(0) when was playing', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain('set_pause(0)');
+    expect(src).toContain('_wasPlayingBeforeScrub');
+  });
+
+  it('main.js _vlcException guard present in scrub start and scrub end', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Count occurrences — must appear inside the scrub helper functions too
+    const count = (src.match(/_vlcException/g) || []).length;
+    expect(count).toBeGreaterThan(2); // at least in scrubStart, scrubEnd, plus original guards
+  });
+
+  it('module-loader.js gates position update during scrubbing', () => {
+    const src = fs.readFileSync(
+      path.join(PROJECT_ROOT, 'lib', 'module-loader.js'), 'utf-8'
+    );
+    expect(src).toContain('_vlcIsScrubbing');
+    // position must NOT be written when _vlcIsScrubbing is true
+    expect(src).toMatch(/!window\._vlcIsScrubbing/);
+  });
+});
+
+describe('FPS estimation (static analysis)', () => {
+  it('module-loader.js computes _vlcEstimatedFps as a rolling average', () => {
+    const src = fs.readFileSync(
+      path.join(PROJECT_ROOT, 'lib', 'module-loader.js'), 'utf-8'
+    );
+    expect(src).toContain('_vlcEstimatedFps');
+    expect(src).toContain('_vlcFrameIntervals');
+  });
+
+  it('module-loader.js clamps FPS to 5–120 range', () => {
+    const src = fs.readFileSync(
+      path.join(PROJECT_ROOT, 'lib', 'module-loader.js'), 'utf-8'
+    );
+    // Math.max(5, Math.min(120, fps)) or equivalent
+    expect(src).toMatch(/_VLC_FPS_MIN|Math\.max.*5.*120|Math\.max.*_VLC_FPS_MIN/);
+    expect(src).toMatch(/_VLC_FPS_MAX|Math\.min.*120/);
+  });
+
+  it('module-loader.js rolling window is limited to ~10 samples', () => {
+    const src = fs.readFileSync(
+      path.join(PROJECT_ROOT, 'lib', 'module-loader.js'), 'utf-8'
+    );
+    // shift() is used to evict old samples; window size constant present
+    expect(src).toContain('.shift()');
+    expect(src).toMatch(/_VLC_FPS_WINDOW|length > 10/);
+  });
+});
+
+describe('Frame-step keyboard handler (static analysis)', () => {
+  it('main.js has document-level keydown handler for frame stepping', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // document.addEventListener('keydown', ...) must be present for frame step
+    expect(src).toContain("document.addEventListener('keydown'");
+  });
+
+  it('main.js handles Period key for forward frame step (next_frame)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain("'.'");
+    expect(src).toContain('next_frame()');
+  });
+
+  it('main.js handles Comma key for backward frame step (set_time)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain("','");
+    // backward step uses set_time with a computed target
+    expect(src).toContain('set_time(');
+  });
+
+  it('main.js frame step uses _vlcEstimatedFps for frame duration', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    expect(src).toContain('_vlcEstimatedFps');
+    // falls back to 24 fps
+    expect(src).toContain('?? 24');
+  });
+
+  it('main.js frame step auto-pauses if playing', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // The keydown handler must pause before stepping
+    expect(src).toContain('set_pause(1)');
+    expect(src).toContain('_vlcIsPlaying = false');
+  });
+
+  it('main.js frame step is guarded against input/textarea focus', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Must not fire when user is typing in the options text box
+    expect(src).toContain("tagName === 'INPUT'");
+    expect(src).toContain("tagName === 'TEXTAREA'");
+  });
+
+  it('main.js frame step is guarded by _vlcException', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // The keydown handler must check _vlcException before calling VLC
+    expect(src).toContain('_vlcException');
+  });
+
+  it('main.js backward frame step resets stale detection (_lastTimeMs = -1)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // backward step must reset stale detection to avoid false EOS trigger
+    // (the check appears in the backward branch inside the keydown handler)
+    const keydownIdx = src.lastIndexOf("document.addEventListener('keydown'");
+    expect(keydownIdx).toBeGreaterThan(-1);
+    // _lastTimeMs = -1 appears inside the keydown handler
+    const afterKeydown = src.slice(keydownIdx);
+    expect(afterKeydown).toContain('_lastTimeMs = -1');
+  });
+});

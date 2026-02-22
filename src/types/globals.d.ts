@@ -150,6 +150,13 @@ declare global {
     // Set by _applySeek to the target timeMs; clears when sought frames arrive.
     // Prevents pre-seek frames from overwriting the immediate playhead feedback.
     _vlcPendingSeekMs?: number;
+    // Rolling average FPS estimated from consecutive VideoFrame timestamps.
+    // Updated each frame in module-loader.ts. Clamped to 5–120 fps.
+    _vlcEstimatedFps?: number;
+    // True while the user is dragging the progress bar scrubber.
+    // When set, module-loader.ts updates cache.timeMs but leaves cache.position
+    // alone (the drag is authoritative for position during scrubbing).
+    _vlcIsScrubbing?: boolean;
     // WebCodecs frame callbacks (set by module-loader.ts)
     _vlcOnDecoderFrame: (pictureId: number, frame: VideoFrame) => void;
     _vlcSetRenderPort1: (port: MessagePort) => void;

@@ -350,10 +350,117 @@ function createHandlers() {
         update_overlay();
     });
     const progressTotal = document.getElementById('bottom-progress');
-    progressTotal.addEventListener('click', function (event) {
+    // ── Drag-scrub state ─────────────────────────────────────────────────────
+    // _isScrubbing: local flag driving mouse/touch event routing.
+    // window._vlcIsScrubbing: global flag read by module-loader to gate
+    //   incoming frame position updates during an active drag.
+    let _isScrubbing = false;
+    let _wasPlayingBeforeScrub = false;
+    // Shorter debounce during drag for responsiveness (vs 150ms at rest).
+    const SCRUB_SEEK_DELAY_MS = 80;
+    // Compute a [0, 1] position from a clientX coordinate relative to the bar.
+    function _posFromClientX(clientX) {
+        const rect = progressTotal.getBoundingClientRect();
+        return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    }
+    function _scrubStart(clientX) {
         if (!window.files || !window.files.length)
             return;
-        _applySeek(event.offsetX / progressTotal.clientWidth);
+        _isScrubbing = true;
+        window._vlcIsScrubbing = true;
+        _wasPlayingBeforeScrub = window._vlcIsPlaying;
+        // Pause playback so seeking doesn't race with active decode.
+        if (window._vlcIsPlaying && !window._vlcException) {
+            media_player.set_pause(1);
+            window._vlcIsPlaying = false;
+        }
+        _applySeek(_posFromClientX(clientX));
+    }
+    function _scrubMove(clientX) {
+        if (!_isScrubbing)
+            return;
+        const pos = _posFromClientX(clientX);
+        // Immediate visual feedback: update cache directly.
+        const cache = window._vlcStateCache;
+        if (cache) {
+            cache.position = pos;
+            if (cache.lengthMs > 0) {
+                cache.timeMs = Math.round(pos * cache.lengthMs);
+                window._vlcPendingSeekMs = cache.timeMs;
+            }
+        }
+        _lastTimeMs = -1;
+        _staleCount = 0;
+        update_overlay();
+        // Debounced VLC seek (shorter window during drag).
+        if (window._vlcException)
+            return;
+        if (_seekTimer !== null)
+            clearTimeout(_seekTimer);
+        _seekTimer = setTimeout(() => {
+            _seekTimer = null;
+            media_player.set_position(pos);
+        }, SCRUB_SEEK_DELAY_MS);
+    }
+    function _scrubEnd(clientX) {
+        if (!_isScrubbing)
+            return;
+        _isScrubbing = false;
+        window._vlcIsScrubbing = false;
+        const finalPos = _posFromClientX(clientX);
+        // Cancel any pending debounced seek and do an immediate final seek.
+        if (_seekTimer !== null) {
+            clearTimeout(_seekTimer);
+            _seekTimer = null;
+        }
+        if (!window._vlcException) {
+            media_player.set_position(finalPos);
+        }
+        // Update cache with final position.
+        const cache = window._vlcStateCache;
+        if (cache) {
+            cache.position = finalPos;
+            if (cache.lengthMs > 0) {
+                cache.timeMs = Math.round(finalPos * cache.lengthMs);
+                window._vlcPendingSeekMs = cache.timeMs;
+            }
+        }
+        _lastTimeMs = -1;
+        _staleCount = 0;
+        update_overlay();
+        // Resume playback if it was playing before the scrub started.
+        if (_wasPlayingBeforeScrub && !window._vlcException) {
+            media_player.set_pause(0);
+            window._vlcIsPlaying = true;
+        }
+    }
+    // ── Mouse drag handlers ──────────────────────────────────────────────────
+    progressTotal.addEventListener('mousedown', (e) => {
+        e.preventDefault(); // prevent text-selection cursor
+        _scrubStart(e.clientX);
+    });
+    function _onMouseMove(e) { _scrubMove(e.clientX); }
+    function _onMouseUp(e) { _scrubEnd(e.clientX); }
+    document.addEventListener('mousemove', _onMouseMove);
+    document.addEventListener('mouseup', _onMouseUp);
+    // ── Touch drag handlers ──────────────────────────────────────────────────
+    progressTotal.addEventListener('touchstart', (e) => {
+        if (e.touches.length < 1)
+            return;
+        e.preventDefault();
+        _scrubStart(e.touches[0].clientX);
+    }, { passive: false });
+    progressTotal.addEventListener('touchmove', (e) => {
+        if (e.touches.length < 1)
+            return;
+        e.preventDefault();
+        _scrubMove(e.touches[0].clientX);
+    }, { passive: false });
+    progressTotal.addEventListener('touchend', (e) => {
+        // changedTouches holds the touch that was lifted.
+        const t = e.changedTouches[0];
+        if (t)
+            _scrubEnd(t.clientX);
     });
     const progressVolumeTotal = document.getElementById('bottom-progress-volume');
     progressVolumeTotal.addEventListener('click', function (event) {
@@ -422,6 +529,57 @@ function createHandlers() {
             e.preventDefault();
             const vol = Math.max(0, (window._vlcStateCache?.volume ?? 80) - step);
             media_player.set_volume(vol);
+            update_overlay();
+        }
+    });
+    // ── Frame-step keyboard handler ──────────────────────────────────────────
+    // `.` (Period) / Alt+ArrowRight → step one frame forward  (next_frame)
+    // `,` (Comma)  / Alt+ArrowLeft  → step one frame backward (set_time)
+    //
+    // Frame duration is derived from the rolling FPS estimate in module-loader.ts;
+    // falls back to 24 fps if no frames have been decoded yet.
+    //
+    // Both directions auto-pause if the player is running, so the stepped frame
+    // is visible and not immediately overwritten by the next decoded frame.
+    document.addEventListener('keydown', (e) => {
+        if (!window.files || !window.files.length || window._vlcException)
+            return;
+        // Ignore keypresses that are inside a text input/textarea (the options box, etc.)
+        const target = e.target;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'))
+            return;
+        const isForward = (e.key === '.' && !e.altKey) || (e.key === 'ArrowRight' && e.altKey);
+        const isBackward = (e.key === ',' && !e.altKey) || (e.key === 'ArrowLeft' && e.altKey);
+        if (!isForward && !isBackward)
+            return;
+        e.preventDefault();
+        // Auto-pause so the stepped frame remains visible.
+        if (window._vlcIsPlaying) {
+            media_player.set_pause(1);
+            window._vlcIsPlaying = false;
+        }
+        // Frame duration in milliseconds.
+        const frameDurationMs = 1000 / (window._vlcEstimatedFps ?? 24);
+        if (isForward) {
+            // next_frame() advances exactly one decoded frame and re-pauses.
+            media_player.next_frame();
+        }
+        else {
+            // Step backward by one frame duration using set_time.
+            const currentMs = window._vlcStateCache?.timeMs ?? 0;
+            const targetMs = Math.max(0, currentMs - frameDurationMs);
+            media_player.set_time(targetMs, false);
+            // Update cache immediately for visual feedback.
+            const cache = window._vlcStateCache;
+            if (cache) {
+                cache.timeMs = targetMs;
+                if (cache.lengthMs > 0) {
+                    cache.position = targetMs / cache.lengthMs;
+                    window._vlcPendingSeekMs = targetMs;
+                }
+            }
+            _lastTimeMs = -1;
+            _staleCount = 0;
             update_overlay();
         }
     });
