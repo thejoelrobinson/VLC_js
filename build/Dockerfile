@@ -112,6 +112,7 @@ COPY audio/ audio/
 # Copy webaudio.js library — provides bridge functions (webaudio_getSampleRate,
 # webaudio_getChannels, webaudio_init) called by the WASM audio output module
 COPY js-libs/ js-libs/
+COPY js-patches/ js-patches/
 
 # Clone the upstream vlc.js repository to get the C wrapper files
 # (main.c, exports_media_player.c, exports_media.c) and JS libraries

@@ -170,17 +170,15 @@ emscripten.c Play() callback (VLC audio decode thread, runs continuously)
 
 ## experimental.js JS Patches
 
-The compiled `experimental.js` requires runtime JS patches to work with VLC 4.0 / Emscripten 4.0.1. These are applied after every Docker build:
+After a Docker rebuild, `experimental.js` requires **no manual patching**. The VideoDecoder patch is injected automatically via `--pre-js` at link time. Patches 2–5 are fixed at the C++ source level.
 
-| Patch | Location | Why |
+| Patch | Location | How applied |
 |---|---|---|
-| VideoDecoder deferred configure | Top of file (prototype) | Defer `configure()` until first chunk arrives so SPS codec can be read; use `avc3.7a0033` (Annex B, correct H.264 profile) |
-| probeConfig dimension + codec fix | `probeConfig` function | Zero dimensions rejected by `isConfigSupported`; bare `avc1` → `avc3.7a0033` |
-| `globalThis.Module` → `Module` | webcodec EM_JS functions | `globalThis.Module` undefined on worker threads; use closure var `Module` |
-| `bindVideoFrame` → `window._vlcAwaitFrame` | `__asyncjs__bindVideoFrame` | VLC 4.0 glinterop never opens; route frames through JS-side frame storage |
-| `boundOutputCb` null guard | boundOutputCb function | Prevent null `webCodecCtx` from causing WASM heap corruption |
-
-These patches are applied by the Python script in the deploy step. The source fixes are in `build/webcodec/webcodec.cpp` and `build/js-libs/webaudio.js` for future rebuilds.
+| VideoDecoder deferred configure | Top of file (global scope, before factory) | **Auto** — `--pre-js build/js-patches/videodecoder-deferred-configure.js` in `create_main.sh` |
+| probeConfig dimension + codec fix | `probeConfig` function (compiled WASM) | In C++ source — `build/webcodec/webcodec.cpp` |
+| `globalThis.Module` → `Module` | webcodec EM_JS functions (compiled WASM) | In C++ source — `build/webcodec/webcodec.cpp` |
+| `bindVideoFrame` → `window._vlcAwaitFrame` | `__asyncjs__bindVideoFrame` (compiled WASM) | In C++ source — `build/webcodec/interop_emscripten.cpp` |
+| `boundOutputCb` null guard | boundOutputCb (compiled WASM) | In C++ source — `build/webcodec/webcodec.cpp` |
 
 ---
 
@@ -323,12 +321,7 @@ npm test               # 93 unit tests
 npm run test:browser   # Browser test (server must be running)
 ```
 
-After Docker rebuild, re-apply JS patches to experimental.js:
-```python
-# See the patch application script pattern in prior sessions
-# Patches: VideoDecoder avc3.7a0033, probeConfig, globalThis.Module,
-#          bindVideoFrame, boundOutputCb null guard
-```
+After Docker rebuild, no manual JS patches are needed. The VideoDecoder deferred configure patch is auto-injected via `--pre-js` at link time (`build/js-patches/videodecoder-deferred-configure.js`). All other patches are fixed in C++ source.
 
 ---
 
