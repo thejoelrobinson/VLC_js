@@ -235,12 +235,19 @@ function createHandlers(): void {
       _lengthPollTick++;
 
       // ── Duration polling ────────────────────────────────────────────────
-      // get_length() reads a cached value from VLC's player struct (no
-      // pthread_cond_timedwait, unlike get_time/get_position). Safe to call
-      // from the main thread once VLC has parsed the container (~1–5s).
-      // Poll every ~2s until we get a valid value, then stop.
+      // get_length() reads a cached value in VLC's player struct. It is safe
+      // ONLY during steady-state playback — NOT during init or EOS cleanup,
+      // when vlc_player_Lock may be held by VLC threads causing ASYNCIFY
+      // deadlock. Guards:
+      //   _lengthPollTick >= 4  → wait ~1s after playback starts
+      //   timeMs > 1000         → decoder is warmed up, not at tick 0
+      //   _staleCount === 0     → not in EOS cleanup phase (frames still live)
       if (!_lengthKnown && window._vlcIsPlaying &&
-          window._vlcStateCache && _lengthPollTick % 8 === 0) {
+          window._vlcStateCache &&
+          window._vlcStateCache.timeMs > 1000 &&   // not at init (tick 0)
+          _staleCount === 0 &&                       // not in EOS cleanup
+          _lengthPollTick >= 4 &&                    // ≥1s since play started
+          _lengthPollTick % 8 === 0) {               // every ~2s
         try {
           const len = Number(media_player.get_length());
           if (len > 0) {
@@ -248,6 +255,16 @@ function createHandlers(): void {
             _lengthKnown = true;
           }
         } catch(e) { /* lock contended — retry next cycle */ }
+      }
+
+      // ── EOS fallback: set duration from last known frame time ─────────────
+      // If get_length() never succeeded (rare), derive approximate duration
+      // from the final frame's timestamp when EOS is detected below.
+      if (window._vlcIsPlaying && window._vlcStateCache &&
+          !_lengthKnown && _staleCount >= 5 &&
+          window._vlcStateCache.timeMs > 0) {
+        window._vlcStateCache.lengthMs = window._vlcStateCache.timeMs + 100;
+        _lengthKnown = true;
       }
 
       // ── End-of-stream detection ──────────────────────────────────────────
@@ -272,17 +289,22 @@ function createHandlers(): void {
   }
   requestAnimationFrame(_uiLoop);
 
+  // Debounce timer for seek commands sent to VLC.
+  // Rapid scrubbing updates the cache instantly for smooth visual feedback
+  // but only sends the actual set_position() call to VLC after the user
+  // pauses for 150ms — prevents spamming vlc_player_Lock and deadlocking.
+  let _seekTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Helper: immediately write a new position to the cache so the playhead
   // moves the instant the user seeks, without waiting for the next frame.
   function _applySeek(newPos: number): void {
-    media_player.set_position(newPos);
+    // Immediate visual feedback — update cache before any VLC call.
     const cache = window._vlcStateCache;
     if (cache) {
       cache.position = newPos;
       if (cache.lengthMs > 0) {
         cache.timeMs = Math.round(newPos * cache.lengthMs);
-        // Tell the frame handler to ignore pre-seek frames so they don't
-        // overwrite this immediate playhead feedback before new frames arrive.
+        // Gate pre-seek frames so they don't overwrite this feedback.
         window._vlcPendingSeekMs = cache.timeMs;
       }
     }
@@ -290,6 +312,15 @@ function createHandlers(): void {
     _lastTimeMs = -1;
     _staleCount = 0;
     update_overlay();
+
+    // Debounce the actual VLC seek command (set_position acquires
+    // vlc_player_Lock). Rapid scrubbing would spam the lock and risk
+    // ASYNCIFY deadlock. Only send the command after 150ms of inactivity.
+    if (_seekTimer !== null) clearTimeout(_seekTimer);
+    _seekTimer = setTimeout(() => {
+      _seekTimer = null;
+      media_player.set_position(newPos);
+    }, 150);
   }
 
   const playButton = document.getElementById('play-button')!;

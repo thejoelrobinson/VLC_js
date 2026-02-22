@@ -73,10 +73,18 @@ describe('Interaction freeze prevention (static analysis)', () => {
 });
 
 describe('Duration and scrubbing (static analysis)', () => {
-  it('main.js RAF loop polls get_length() to populate lengthMs', () => {
+  it('main.js get_length() poll has all three safety guards', () => {
     const src = fs.readFileSync(MAIN_JS, 'utf-8');
-    // The RAF loop must call media_player.get_length() to discover video duration
-    expect(src).toContain('get_length()');
+    // Guard 1: timeMs > 1000 — not at initialization (prevents lock contention
+    //           during decoder init, which causes function signature mismatch)
+    expect(src).toContain('timeMs > 1000');
+    // Guard 2: _staleCount === 0 — not in EOS cleanup (prevents deadlock when
+    //           VLC cleanup thread holds vlc_player_Lock)
+    expect(src).toContain('_staleCount === 0');
+    // Guard 3: minimum tick count — at least 1s since playback started
+    expect(src).toContain('_lengthPollTick >= 4');
+    // Guard 4: periodic polling every ~2s
+    expect(src).toContain('_lengthPollTick % 8 === 0');
   });
 
   it('main.js has _applySeek helper that writes back to _vlcStateCache', () => {
@@ -123,10 +131,30 @@ describe('Duration and scrubbing (static analysis)', () => {
     expect(src).toContain('_staleCount = 0');
   });
 
+  it('_applySeek is debounced — set_position() is inside a setTimeout', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Rapid scrubbing must NOT call set_position() on every mouse event.
+    // The VLC seek is debounced inside a 150ms setTimeout so the lock is
+    // not spammed, preventing ASYNCIFY deadlock during rapid rewind.
+    expect(src).toContain('_seekTimer');
+    expect(src).toContain('set_position(newPos)');
+    // set_position must appear INSIDE the setTimeout callback
+    const timerIdx = src.indexOf('setTimeout');
+    const setPosIdx = src.indexOf('set_position(newPos)');
+    expect(timerIdx).toBeGreaterThan(-1);
+    expect(setPosIdx).toBeGreaterThan(timerIdx);
+  });
+
   it('_applySeek sets _vlcPendingSeekMs to gate pre-seek frames', () => {
     const src = fs.readFileSync(MAIN_JS, 'utf-8');
     // _vlcPendingSeekMs prevents old frames clobbering the immediate feedback
     expect(src).toContain('_vlcPendingSeekMs');
+  });
+
+  it('main.js has EOS fallback: derives lengthMs from last frame timeMs', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // If get_length() never succeeds, approximate duration from last frame
+    expect(src).toContain('timeMs + 100');
   });
 
   it('module-loader.js respects _vlcPendingSeekMs to guard position updates', () => {
