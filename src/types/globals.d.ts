@@ -144,6 +144,9 @@ declare global {
     _vlcIsPlaying: boolean;
     // Cached VLC state for overlay UI (position, time, volume, etc.)
     _vlcStateCache?: VlcStateCache;
+    // Set by window.onerror when VLC throws a WASM exception. Once set,
+    // VLC's internal state is unrecoverable without a page reload.
+    _vlcException?: boolean;
     // Set by _applySeek to the target timeMs; clears when sought frames arrive.
     // Prevents pre-seek frames from overwriting the immediate playhead feedback.
     _vlcPendingSeekMs?: number;

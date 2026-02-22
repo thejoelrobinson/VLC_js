@@ -133,6 +133,11 @@ function createHandlers(): void {
     // TODO: do not warn on ok events like simulating an infinite loop or exitStatus
     window.Module.setStatus('Exception thrown, see JavaScript console');
     body.dispatchEvent(isNotLoading);
+    // Mark VLC's WASM state as unrecoverable. A function signature mismatch or
+    // other WASM RuntimeError leaves internal locks and call stacks corrupted —
+    // any subsequent VLC call (including play/pause/seek) will deadlock.
+    // The only safe recovery is a full page reload.
+    window._vlcException = true;
     window.Module.setStatus = function(text: string): void {
       if (text) window.Module.printErr('[post-exception status] ' + text);
     };
@@ -341,8 +346,27 @@ function createHandlers(): void {
         media_player.set_pause(1);
         window._vlcIsPlaying = false;
       } else {
+        // If VLC threw a WASM exception, its internal state is corrupted and
+        // any VLC call will deadlock. Reload for a clean slate.
+        if (window._vlcException) {
+          window.location.reload();
+          return;
+        }
         media_player.play();
         window._vlcIsPlaying = true;
+        // Reset position cache so the progress bar returns to the beginning.
+        // Setting timeMs = 0 also suppresses the stale-detection loop while
+        // VLC reinitialises after EOS — the guard `currentTimeMs > 0` means
+        // stale detection won't fire when timeMs is 0, giving VLC time to
+        // deliver its first frame without _vlcIsPlaying being killed early.
+        if (window._vlcStateCache) {
+          window._vlcStateCache.timeMs = 0;
+          window._vlcStateCache.position = 0;
+        }
+        window._vlcPendingSeekMs = 0;
+        _lastTimeMs = -1;
+        _staleCount = 0;
+        if (_seekTimer !== null) { clearTimeout(_seekTimer); _seekTimer = null; }
       }
     } else {
       inputElement.click();

@@ -166,6 +166,39 @@ describe('Duration and scrubbing (static analysis)', () => {
   });
 });
 
+describe('Replay after end-of-stream', () => {
+  it('main.js sets _vlcException flag in window.onerror', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // window.onerror must set _vlcException = true so subsequent calls
+    // know VLC's WASM state is unrecoverable (any VLC call will deadlock)
+    expect(src).toContain('_vlcException = true');
+  });
+
+  it('main.js handlePlayPause checks _vlcException before calling play()', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // After a WASM exception, calling media_player.play() would deadlock.
+    // The guard must trigger a page reload instead.
+    expect(src).toContain('_vlcException');
+    expect(src).toContain('location.reload()');
+  });
+
+  it('main.js resets timeMs=0 on play() to suppress stale-detection during restart', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Stale detection checks `currentTimeMs > 0` — setting timeMs=0 keeps
+    // _vlcIsPlaying=true while VLC reinitialises after EOS (takes 1-5s).
+    // Without this, stale detection fires and kills _vlcIsPlaying before
+    // the first new frame arrives.
+    expect(src).toContain('timeMs = 0');
+    expect(src).toContain('position = 0');
+  });
+
+  it('main.js cancels pending seek timer on play() restart', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // A leftover debounced seek from before EOS must not fire after replay
+    expect(src).toContain('clearTimeout(_seekTimer)');
+  });
+});
+
 describe('VLC API safety classification', () => {
   // Verify the compiled main.js only calls safe (non-blocking) VLC APIs
   // from the main browser thread.
