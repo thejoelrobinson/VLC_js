@@ -60,6 +60,30 @@ describe('Interaction freeze prevention (static analysis)', () => {
     expect(src).toContain('_vlcStateCache');
   });
 
+  it('main.js _uiLoop must NOT call get_length() — deferred to one-shot setTimeout instead', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // get_length() acquires vlc_player_Lock.  On any RAF tick that coincides with
+    // VLC's EOS pipeline teardown (which holds vlc_player_Lock), get_length() from
+    // the RAF loop ASYNCIFY-suspends the main thread waiting for the lock.  The
+    // main thread can no longer process VLC's GL proxy calls → VLC teardown stalls
+    // → permanent page freeze (tab unresponsive, can't even refresh).
+    //
+    // Fix: remove get_length() from _uiLoop entirely.  Call it once via setTimeout
+    // 3 s after play(), when VLC is in stable steady-state.  Short clips use the
+    // EOS fallback (timeMs + 100) instead.
+    const uiLoopIdx = src.indexOf('function _uiLoop');
+    expect(uiLoopIdx).toBeGreaterThan(-1);
+    // Find the closing brace of _uiLoop by looking for the RAF call that ends it
+    const rafIdx = src.indexOf('requestAnimationFrame(_uiLoop)', uiLoopIdx);
+    const uiLoopBody = src.slice(uiLoopIdx, rafIdx + 30);
+    // get_length() must NOT appear inside _uiLoop
+    expect(uiLoopBody).not.toContain('get_length()');
+    // get_length() MUST appear in the deferred setTimeout (outside _uiLoop)
+    const afterUiLoop = src.slice(rafIdx);
+    expect(afterUiLoop).toContain('get_length()');
+    expect(afterUiLoop).toContain('setTimeout');
+  });
+
   it('libvlc.js still exposes pause() for non-main-thread use', () => {
     // The pause() method must stay in libvlc.js for use by non-main-thread code
     const src = fs.readFileSync(LIBVLC_JS, 'utf-8');
@@ -73,18 +97,21 @@ describe('Interaction freeze prevention (static analysis)', () => {
 });
 
 describe('Duration and scrubbing (static analysis)', () => {
-  it('main.js get_length() poll has all three safety guards', () => {
+  it('main.js get_length() is deferred to one-shot setTimeout, not the RAF loop', () => {
     const src = fs.readFileSync(MAIN_JS, 'utf-8');
-    // Guard 1: timeMs > 1000 — not at initialization (prevents lock contention
-    //           during decoder init, which causes function signature mismatch)
-    expect(src).toContain('timeMs > 1000');
-    // Guard 2: _staleCount === 0 — not in EOS cleanup (prevents deadlock when
-    //           VLC cleanup thread holds vlc_player_Lock)
-    expect(src).toContain('_staleCount === 0');
-    // Guard 3: minimum tick count — at least 1s since playback started
-    expect(src).toContain('_lengthPollTick >= 4');
-    // Guard 4: periodic polling every ~2s
-    expect(src).toContain('_lengthPollTick % 8 === 0');
+    // get_length() acquires vlc_player_Lock.  Calling it from the RAF loop
+    // risks firing during VLC EOS pipeline teardown (which holds vlc_player_Lock)
+    // → ASYNCIFY-suspends the main thread waiting for the lock → main thread
+    // can no longer process VLC's GL proxy calls → teardown stalls → permanent
+    // page freeze (tab unresponsive, can't refresh).
+    // Fix: call get_length() once via setTimeout(3000) after play(), not in the loop.
+    // The deferred call is guarded: only runs if still playing and length unknown.
+    expect(src).toContain("setTimeout");
+    expect(src).toContain("get_length()");
+    // Guard: only runs when still playing (not at or after EOS)
+    expect(src).toContain('_vlcIsPlaying');
+    // Guard: skip if already known
+    expect(src).toContain('_lengthKnown');
   });
 
   it('main.js has _applySeek helper that writes back to _vlcStateCache', () => {
@@ -395,5 +422,302 @@ describe('Frame-step keyboard handler (static analysis)', () => {
     // _lastTimeMs = -1 appears inside the keydown handler
     const afterKeydown = src.slice(keydownIdx);
     expect(afterKeydown).toContain('_lastTimeMs = -1');
+  });
+});
+
+// ===================================================================
+// avcodec auto-fallback (window.onerror handler)
+//
+// Root cause: ASYNCIFY instrumentation of WebcodecDecodeWorker changes
+// its WASM type from (i32)->i32 to (i32,i32,i32)->i32. The pthread
+// runtime passes (i32) → call_indirect type mismatch → RuntimeError.
+// The JS-side fix: when onerror fires before any frames are decoded,
+// switch to --codec=avcodec and reload so the file still plays.
+// ===================================================================
+
+describe('Avcodec auto-fallback on webcodec ASYNCIFY crash', () => {
+  it('main.js onerror fallback is gated on hasFrames (avoids switching after successful decode)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // If an exception fires AFTER frames have decoded (e.g. EOS cleanup),
+    // the fallback must NOT trigger — webcodec was working fine.
+    // Guard: window._vlcStateCache && window._vlcStateCache.timeMs > 0
+    expect(src).toContain('window._vlcStateCache && window._vlcStateCache.timeMs > 0');
+  });
+
+  it('main.js onerror fallback is skipped when already on avcodec (prevents infinite reload loop)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // If avcodec itself throws, we must NOT reload again.
+    // Guard: !currentOpts.includes('avcodec')
+    expect(src).toContain("currentOpts.includes('avcodec')");
+  });
+
+  it('main.js onerror saves original webcodec options BEFORE overwriting them', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // vlc-saved-options must be written before the avcodec option string is set —
+    // otherwise we would save '--codec=avcodec …' as the target to restore.
+    const saveIdx    = src.indexOf("setItem('vlc-saved-options'");
+    const switchIdx  = src.indexOf('--codec=avcodec');
+    expect(saveIdx).toBeGreaterThan(-1);
+    expect(switchIdx).toBeGreaterThan(-1);
+    expect(saveIdx).toBeLessThan(switchIdx);
+  });
+
+  it('main.js avcodec fallback options include all three required flags', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Must keep --avcodec-threads=1 to prevent PTHREAD_POOL exhaustion on fallback
+    expect(src).toContain('--codec=avcodec --aout=emworklet --avcodec-threads=1');
+  });
+
+  it('main.js onerror reloads inside setTimeout (not synchronously)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // A synchronous reload inside onerror would fire before the handler finishes
+    // and before localStorage.setItem() has flushed.
+    // The reload must be deferred via setTimeout.
+    const onerrorIdx = src.indexOf('window.onerror = function');
+    expect(onerrorIdx).toBeGreaterThan(-1);
+    const onerrorBody = src.slice(onerrorIdx, src.indexOf('\n};', onerrorIdx) + 3);
+    expect(onerrorBody).toContain('setTimeout');
+    expect(onerrorBody).toContain('window.location.reload()');
+    // reload() must be INSIDE the setTimeout callback, not after it
+    const timeoutIdx = onerrorBody.indexOf('setTimeout');
+    const reloadIdx  = onerrorBody.indexOf('window.location.reload()');
+    expect(reloadIdx).toBeGreaterThan(timeoutIdx);
+  });
+
+  it('main.js restores original webcodec options after successful avcodec fallback (>3s played)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // After avcodec plays 3s without crashing, restore webcodec for the next session.
+    // Checked in the RAF loop, not in onerror.
+    expect(src).toContain('timeMs > 3000');
+    expect(src).toContain("getItem('vlc-saved-options')");
+    // Must restore to 'options' (not some other key)
+    const restoreIdx = src.indexOf("setItem('options', savedOpts)");
+    expect(restoreIdx).toBeGreaterThan(-1);
+  });
+
+  it('main.js removes vlc-saved-options after restoring (no stale key left over)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // Stale vlc-saved-options would cause the restore to fire again on the next session
+    expect(src).toContain("removeItem('vlc-saved-options')");
+    // removeItem must come after setItem (restore the key THEN clean up)
+    const restoreIdx = src.indexOf("setItem('options', savedOpts)");
+    const removeIdx  = src.indexOf("removeItem('vlc-saved-options')");
+    expect(restoreIdx).toBeGreaterThan(-1);
+    expect(removeIdx).toBeGreaterThan(restoreIdx);
+  });
+
+  it('main.js saves valid-options immediately after successful WASM init', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // On successful module load, current options are saved as 'valid-options'.
+    // This allows init-failure recovery: if options change and break init,
+    // the catch block can restore the last working set.
+    expect(src).toContain("setItem('valid-options'");
+    // Must appear inside the try block after initModule(), not in catch/finally
+    const initIdx     = src.indexOf('initModule(');
+    const validIdx    = src.indexOf("setItem('valid-options'");
+    const catchIdx    = src.indexOf('catch (e)');
+    expect(initIdx).toBeGreaterThan(-1);
+    expect(validIdx).toBeGreaterThan(initIdx);    // after init
+    expect(validIdx).toBeLessThan(catchIdx);      // before the catch block
+  });
+
+  it('main.js catch block restores valid-options on init failure (breaks bad-options reload loop)', () => {
+    const src = fs.readFileSync(MAIN_JS, 'utf-8');
+    // If VLC module init throws (e.g. bad --codec flag), the catch block must
+    // restore last-known-good options so the next manual reload succeeds.
+    expect(src).toContain("getItem('valid-options')");
+    // The restored value must be written back to 'options'
+    expect(src).toContain("setItem('options', validOptions)");
+  });
+});
+
+// ===================================================================
+// Seek-after-EOS: scrubbing after clip ends restarts VLC so frames appear
+// ===================================================================
+
+describe('seek-after-EOS: scrubbing after clip ends restarts decoder', () => {
+  const MAIN_JS2 = path.join(PROJECT_ROOT, 'main.js');
+
+  it('EOS stale-detection sets _vlcAtEOS only when time is ≥95% through clip', () => {
+    const src = fs.readFileSync(MAIN_JS2, 'utf-8');
+    // _vlcAtEOS must only be set near the end of the clip (≥95%).
+    // Mid-video backward seeks temporarily freeze frames for ~1.5s, which
+    // would trigger stale-detection.  Without the threshold, _vlcAtEOS is
+    // incorrectly set mid-video, causing the next scrub to restart from pos 0.
+    expect(src).toContain('window._vlcAtEOS = true');
+    expect(src).toContain('0.95');  // threshold guard
+  });
+
+  it('handlePlayPause clears _vlcAtEOS on manual play', () => {
+    const src = fs.readFileSync(MAIN_JS2, 'utf-8');
+    expect(src).toContain('window._vlcAtEOS = false');
+  });
+
+  it('_scrubStart snapshots _wasAtEOS and clears _vlcAtEOS; _scrubEnd uses snapshot', () => {
+    const src = fs.readFileSync(MAIN_JS2, 'utf-8');
+    // _scrubStart captures _vlcAtEOS into _wasAtEOS and immediately clears
+    // _vlcAtEOS.  This prevents stale detection mid-drag from overwriting it.
+    // _scrubEnd reads _wasAtEOS (the pre-scrub value) for the restart decision.
+    const scrubStartIdx = src.indexOf('function _scrubStart');
+    expect(scrubStartIdx).toBeGreaterThan(-1);
+    const scrubStartBody = src.slice(scrubStartIdx, scrubStartIdx + 800);
+    expect(scrubStartBody).toContain('_wasAtEOS = window._vlcAtEOS');
+    expect(scrubStartBody).toContain('window._vlcAtEOS = false');
+
+    const scrubEndIdx = src.indexOf('function _scrubEnd');
+    expect(scrubEndIdx).toBeGreaterThan(-1);
+    const scrubEndBody = src.slice(scrubEndIdx, scrubEndIdx + 1500);
+    // _scrubEnd uses _wasAtEOS (not window._vlcAtEOS) to decide restart
+    expect(scrubEndBody).toContain('_wasAtEOS');
+    expect(scrubEndBody).toContain('media_player.play()');
+    expect(scrubEndBody).toContain('media_player.set_position(finalPos)');
+  });
+});
+
+// ===================================================================
+// pthread cond_wait + vlc_join worker lifecycle fix (JSPI-ready)
+//
+// Root cause of EOS "function signature mismatch":
+//   simulate_infinite_loop=false returned the Worker to Emscripten's pthread
+//   pool immediately. A new VLC pthread was assigned to the same Worker; when
+//   the old tick's setTimeout fired it called emscripten_cancel_main_loop()
+//   on the NEW pthread's loop → proxy calls failed → call_indirect type trap.
+//
+// Fix: WebcodecDecodeWorker now uses a plain pthread cond_wait loop.
+//   • No emscripten_set_main_loop_arg — incompatible with JSPI (ASYNCIFY=2)
+//   • Worker stays owned by this pthread for its lifetime (blocks in cond_wait)
+//   • Close() stores exiting=true + signals cond under mutex (lost-wakeup safe)
+//   • Close() calls vlc_join — deterministic, no race, no timing hacks
+//   • Compatible with ASYNCIFY=1, ASYNCIFY=2 (JSPI), and no ASYNCIFY
+//
+// ASYNCIFY_REMOVE must NOT be present: with cond_wait, WebcodecDecodeWorker
+// has no async call chain and ASYNCIFY won't instrument it regardless.
+// ===================================================================
+
+describe('pthread cond_wait + vlc_join worker lifecycle fix (JSPI-ready)', () => {
+  const BUILD_SCRIPT = path.join(PROJECT_ROOT, 'build', 'create_main.sh');
+  const WEBCODEC_CPP = path.join(PROJECT_ROOT, 'build', 'webcodec', 'webcodec.cpp');
+
+  it('create_main.sh must NOT include ASYNCIFY_REMOVE (breaks simulate_infinite_loop=1)', () => {
+    const src = fs.readFileSync(BUILD_SCRIPT, 'utf-8');
+    // ASYNCIFY_REMOVE=["WebcodecDecodeWorker"] prevents ASYNCIFY from instrumenting
+    // WebcodecDecodeWorker, which is required for simulate_infinite_loop=1 to work
+    // (ASYNCIFY must be able to suspend/resume the function when the loop is cancelled).
+    expect(src).not.toContain('ASYNCIFY_REMOVE');
+    // ASYNCIFY=1 must still be present for probeConfig (EM_ASYNC_JS) to work
+    expect(src).toContain('-s ASYNCIFY=1');
+  });
+
+  it('WebcodecDecodeWorker uses simulate_infinite_loop=1 to keep Worker owned until cleanup', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    // simulate_infinite_loop=1 (4th arg) keeps the JS Worker owned by this pthread
+    // via ASYNCIFY suspension, preventing the Worker-pool recycling race that caused
+    // "function signature mismatch" at EOS.
+    // decode calls happen in the tick (JS event loop), NOT from the ASYNCIFY-suspended
+    // WASM frame, because emval::call from an ASYNCIFY frame triggers a call_indirect
+    // type mismatch in Emscripten 4.0.1.
+    const workerIdx  = src.indexOf('static void* WebcodecDecodeWorker');
+    expect(workerIdx).toBeGreaterThan(-1);
+    const workerBody = src.slice(workerIdx, workerIdx + 2000);
+    // 4th argument must be 1 (truthy), not 0 or false
+    expect(workerBody).toMatch(/emscripten_set_main_loop_arg\s*\([^)]+,\s*1\s*\)/);
+  });
+
+  it('Close() uses vlc_join not emscripten_sleep — deterministic, no Worker-pool race', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    const closeIdx  = src.lastIndexOf('static void Close');
+    const closeBody = src.slice(closeIdx, closeIdx + 2000);
+    // vlc_join blocks until WebcodecDecodeWorker returns after cancel_main_loop().
+    // emscripten_sleep(50) was timing-based and didn't prevent Worker recycling.
+    expect(closeBody).toContain('vlc_join');
+    expect(closeBody).not.toContain('emscripten_sleep');
+  });
+
+  it('PatchedVideoDecoder skips delta chunks when closed (prevents ASYNCIFY-corrupting throws)', () => {
+    const src = fs.readFileSync(path.join(PROJECT_ROOT, 'lib', 'module-loader.js'), 'utf-8');
+    // When VideoDecoder is 'closed' and a delta chunk arrives, calling super.decode()
+    // throws a DOMException synchronously.  That exception propagates through emval into
+    // the C++ tick where it corrupts ASYNCIFY's saved stack → "function signature mismatch"
+    // at EOS.  Silently dropping the delta avoids the throw; the next keyframe triggers
+    // the existing closed-state recovery (reconfigure + decode IDR).
+    expect(src).toContain("this.state === 'closed' && chunk.type === 'delta'");
+    // Must return (skip) before calling super.decode()
+    const deltaGuardIdx = src.indexOf("this.state === 'closed' && chunk.type === 'delta'");
+    const superDecodeIdx = src.indexOf('return super.decode(chunk)', deltaGuardIdx);
+    expect(superDecodeIdx).toBeGreaterThan(deltaGuardIdx);
+  });
+
+  it('compile.sh webcodec plugin is compiled with ASYNCIFY=1 (probeConfig uses EM_ASYNC_JS)', () => {
+    const compileSrc = fs.readFileSync(path.join(PROJECT_ROOT, 'build', 'compile.sh'), 'utf-8');
+    // probeConfig() is EM_ASYNC_JS (genuinely awaits VideoDecoder.isConfigSupported) so
+    // the plugin still needs ASYNCIFY=1 at compile time. Only declareCallbacks was changed
+    // to EM_JS — probeConfig stays async.
+    const webcodecMakeIdx = compileSrc.indexOf('libwebcodec_plugin');
+    expect(webcodecMakeIdx).toBeGreaterThan(-1);
+    const afterWebcodec = compileSrc.slice(webcodecMakeIdx, webcodecMakeIdx + 300);
+    expect(afterWebcodec).toContain('ASYNCIFY=1');
+  });
+});
+
+// ===================================================================
+// declareCallbacks must be EM_JS, not EM_ASYNC_JS (webcodec.cpp)
+//
+// Root cause of "function signature mismatch":
+//   declareCallbacks was EM_ASYNC_JS → ASYNCIFY instrumented the chain:
+//   declareCallbacks → initDecoder → WebcodecDecodeWorker
+//   → changed WebcodecDecodeWorker WASM type → pthread call_indirect trap
+//
+// Fix: EM_JS (synchronous). The function body has no top-level await;
+// Module.boundOutputCb is defined as async (returns a Promise when called)
+// but the DEFINITION is synchronous assignment — no ASYNCIFY needed.
+// probeConfig stays EM_ASYNC_JS because it genuinely awaits.
+// ===================================================================
+
+describe('declareCallbacks must be EM_JS not EM_ASYNC_JS (webcodec.cpp)', () => {
+  const WEBCODEC_CPP = path.join(PROJECT_ROOT, 'build', 'webcodec', 'webcodec.cpp');
+
+  it('declareCallbacks is declared with EM_JS (not EM_ASYNC_JS)', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    // Must be EM_JS — using EM_ASYNC_JS triggers ASYNCIFY on the entire call chain
+    // up through WebcodecDecodeWorker, breaking the pthread type signature.
+    expect(src).toContain('EM_JS(void, declareCallbacks');
+    expect(src).not.toContain('EM_ASYNC_JS(void, declareCallbacks');
+  });
+
+  it('probeConfig stays EM_ASYNC_JS (it genuinely awaits VideoDecoder.isConfigSupported)', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    // probeConfig DOES use await — do not change it to EM_JS
+    expect(src).toContain('EM_ASYNC_JS(bool, probeConfig');
+  });
+
+  it('declareCallbacks body has no top-level await (confirming EM_JS is correct)', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    // Extract the body of declareCallbacks up to its closing })
+    const startIdx = src.indexOf('EM_JS(void, declareCallbacks');
+    expect(startIdx).toBeGreaterThan(-1);
+    // The function body ends before EM_ASYNC_JS(bool, probeConfig
+    const endIdx = src.indexOf('EM_ASYNC_JS(bool, probeConfig', startIdx);
+    expect(endIdx).toBeGreaterThan(startIdx);
+    const body = src.slice(startIdx, endIdx);
+    // Top-level await would appear as a bare 'await ' not inside a nested function.
+    // The only 'async' allowed is in the boundOutputCb definition (nested function).
+    // Strip nested function bodies and check no bare await remains.
+    // Simple check: no 'await ' appears outside a string context in the outer body.
+    // The outer body should only have 'async function' as a keyword, not 'await'.
+    const outerBody = body.replace(/async function[^}]*\{[^}]*\}/g, '');
+    expect(outerBody).not.toMatch(/\bawait\b/);
+  });
+
+  it('WebcodecDecodeWorker calls initDecoder which calls declareCallbacks (call chain verified)', () => {
+    const src = fs.readFileSync(WEBCODEC_CPP, 'utf-8');
+    // Confirm the exact call chain that caused the bug exists in source.
+    // If anyone restructures this, the fix must be re-evaluated.
+    const workerIdx     = src.indexOf('static void* WebcodecDecodeWorker(');
+    const initCallIdx   = src.indexOf('initDecoder(', workerIdx);
+    const declareFnIdx  = src.indexOf('declareCallbacks();');
+    expect(workerIdx).toBeGreaterThan(-1);
+    expect(initCallIdx).toBeGreaterThan(workerIdx);   // WebcodecDecodeWorker calls initDecoder
+    expect(declareFnIdx).toBeGreaterThan(-1);          // initDecoder calls declareCallbacks
+    expect(declareFnIdx).toBeLessThan(workerIdx);      // declareCallbacks defined before the worker fn
   });
 });

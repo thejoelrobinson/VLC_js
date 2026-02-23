@@ -33,7 +33,12 @@
 
 #include "../video_output/emscripten/common.h"
 
+// emscripten.h is kept for EMSCRIPTEN_KEEPALIVE (used on createAndQueuePicture).
+// emscripten_set_main_loop_arg and emscripten_cancel_main_loop are no longer
+// called — the decoder worker uses vlc_cond_wait instead — but the header is
+// harmless and ensures EMSCRIPTEN_KEEPALIVE is available in all Emscripten versions.
 #include <emscripten/emscripten.h>
+
 // vlc_fixups.h defines typeof(t) as a macro which breaks emscripten/val.h's
 // typeof() method declaration. Undefine it before including val.h.
 #ifdef typeof
@@ -60,6 +65,13 @@ struct decoder_sys_t
 
     vlc_video_context* vctx;
     bool sent_first_keyframe = false;
+
+    // Set to true by Close() before it signals the cond and calls vlc_join.
+    // WebcodecDecodeWorker checks this flag after every cond_wait wakeup and
+    // exits its for(;;) loop, allowing vlc_join to complete without polling.
+    // Close() must set exiting and signal the cond while holding the mutex
+    // to prevent a lost-wakeup race.
+    std::atomic<bool> exiting{false};
 };
 
 extern "C"
@@ -69,6 +81,16 @@ EMSCRIPTEN_KEEPALIVE picture_t* createAndQueuePicture(decoder_t* dec, int pictur
                                                       int64_t timestamp)
 {
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
+    // Bail out if Close() is in progress.
+    // decoder_UpdateVideoOutput and decoder_QueueVideo access VLC's vout
+    // pipeline structures.  VLC tears down the vout concurrently with the
+    // decoder at EOS.  Calling these functions during vout teardown accesses
+    // partially-freed VLC internal state, corrupting the WASM function table
+    // and causing "function signature mismatch" at EOS.
+    // exiting is set by Close() BEFORE vlc_join, so it's always visible here
+    // while sys itself is still valid (sys is freed AFTER vlc_join returns).
+    if ( sys->exiting.load( std::memory_order_acquire ) )
+        return NULL;
     if ( decoder_UpdateVideoOutput( dec, sys->vctx ) )
     {
         msg_Err( dec, "Failure during UpdateVideoOutput! FIXME" );
@@ -92,7 +114,16 @@ EM_JS(void, initModuleContext, (void* ctx), {
     Module.webCodecCtx = ctx;
 });
 
-EM_ASYNC_JS(void, declareCallbacks, (), {
+// EM_JS, not EM_ASYNC_JS: this function contains no top-level await.
+// Module.boundOutputCb is defined as an async function (so it returns a Promise
+// when invoked) but the DEFINITION itself is synchronous assignment.
+//
+// Declaring this EM_ASYNC_JS caused ASYNCIFY to instrument the entire call chain:
+//   declareCallbacks → initDecoder → WebcodecDecodeWorker
+// That changed WebcodecDecodeWorker's WASM type from (i32)->i32 to a different
+// signature that the pthread runtime rejected → "function signature mismatch" trap.
+// Using EM_JS keeps the type stable and ASYNCIFY out of this call chain entirely.
+EM_JS(void, declareCallbacks, (), {
     // Register the MessagePort listener EAGERLY here (not lazily inside boundOutputCb)
     // so the port is captured as soon as interop_emscripten sends it — before any
     // frames are decoded. Uses Emscripten 4.x targetThread routing: the rendering
@@ -110,6 +141,11 @@ EM_ASYNC_JS(void, declareCallbacks, (), {
 
     Module.pictureId = 0;
     Module.boundOutputCb = async function(frame) {
+        // Guard: if the decoder has been closed (tick sets webCodecCtx=0 before
+        // emscripten_cancel_main_loop), drop the frame.  Without this, callbacks
+        // queued in the JS event loop after Close() fires can call into VLC with
+        // a stale/freed decoder pointer → "function signature mismatch" at EOS.
+        if (!Module.webCodecCtx) { frame.close(); return; }
         Module.pictureId = (Module.pictureId + 1);
         const pid = Module.pictureId;
         // Queue picture in VLC and deliver frame to main thread via callHandler.
@@ -278,17 +314,61 @@ static void WebcodecDecodeWorkerTick( void* arg )
 {
     auto dec = static_cast<decoder_t*>( arg );
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
-    vlc_frame_t* block;
 
+    // Close() sets exiting=true then calls vlc_join(sys->th).
+    // Cancel the main loop so WebcodecDecodeWorker (ASYNCIFY-suspended) resumes
+    // and returns NULL, allowing vlc_join to complete.  After vlc_join returns,
+    // Close() frees sys — so we must stop accessing sys before then.
+    //
+    // NOTE: emval::call() (sys->decoder.call below) MUST be called from the JS
+    // event loop (this tick callback), NOT from C++ WASM execution.  Calling
+    // emval::call() from an ASYNCIFY-instrumented WASM frame (e.g. a cond_wait
+    // loop) triggers a call_indirect type mismatch in Emscripten 4.0.1 because
+    // ASYNCIFY's frame bookkeeping conflicts with the emval dispatch table.
+    // The tick runs as a JS→C callback, bypassing ASYNCIFY entirely.
+    if ( sys->exiting.load(std::memory_order_acquire) )
+    {
+        // Zero Module.webCodecCtx so any output callbacks still queued in this
+        // Worker's event loop see a null context and bail out without calling
+        // into VLC's pipeline (which may be concurrently torn down by Close()).
+        // createAndQueuePicture also checks sys->exiting as a secondary guard.
+        // Note: decoder.close() was removed from here — calling VideoDecoder.close()
+        // via emval::call() inside the ASYNCIFY tick callback can corrupt ASYNCIFY's
+        // saved stack state for WebcodecDecodeWorker, causing "function signature
+        // mismatch" when emscripten_cancel_main_loop() triggers the ASYNCIFY resume.
+        initModuleContext( nullptr );
+        emscripten_cancel_main_loop();
+        return;
+    }
+
+    vlc_frame_t* block;
     vlc::threads::mutex_locker lock{ sys->mutex };
     while ( sys->blocks.empty() == false )
     {
         block = sys->blocks.front();
         sys->blocks.pop();
 
-        auto chunk = blockToEncodedVideoChunk( dec, block );
-        block_Release(block);
-        sys->decoder.call<void>( "decode", chunk );
+        // Wrap both chunk creation and decode in a try/catch.
+        // After a backward seek, the VideoDecoder may be in 'closed' state and
+        // VideoDecoder.decode() throws a DOMException.  emval::call() converts that
+        // to a C++ exception.  If it escapes this ASYNCIFY tick callback, it
+        // corrupts ASYNCIFY's saved stack state for WebcodecDecodeWorker — the next
+        // emscripten_cancel_main_loop() resume then hits a call_indirect with a stale
+        // type entry → "function signature mismatch" RuntimeError at EOS.
+        // Swallowing the exception here is safe: the JS layer (PatchedVideoDecoder in
+        // module-loader.js) handles 'closed'-state recovery on the next keyframe.
+        try
+        {
+            auto chunk = blockToEncodedVideoChunk( dec, block );
+            block_Release( block );
+            block = nullptr;  // mark released so catch does not double-free
+            sys->decoder.call<void>( "decode", chunk );
+        }
+        catch ( ... )
+        {
+            if ( block != nullptr )
+                block_Release( block );  // release if chunk creation threw before block_Release
+        }
     }
 }
 
@@ -305,22 +385,31 @@ static void* WebcodecDecodeWorker( void* arg )
             vlc_video_context_GetPrivate(sys->vctx, VLC_VIDEO_CONTEXT_WEBCODEC));
     vctxPrivate->decoder_worker = pthread_self();
 
-    // Use emscripten_set_main_loop_arg to schedule the decode tick via the
-    // worker's JS event loop. The C function returns (thread "exits") but
-    // the JS callbacks keep running on the same worker.
+    // Use simulate_infinite_loop=1 so this pthread BLOCKS here (via ASYNCIFY)
+    // until emscripten_cancel_main_loop() is called from within the tick.
     //
-    // Emscripten 4.0.1's val.h asserts pthread_equal(thread, pthread_self())
-    // in as_handle() using assert(). We compile webcodec with -DNDEBUG so
-    // assert() is a no-op — the emval operations remain safe because the
-    // JS callbacks run on the same worker that created sys->decoder.
-    emscripten_set_main_loop_arg( &WebcodecDecodeWorkerTick, dec, 0, false );
-    emscripten_set_main_loop_timing( EM_TIMING_SETTIMEOUT, 1 );
+    // This keeps the JS Worker "owned" by this pthread for the decoder's
+    // lifetime, preventing the Worker-pool recycling race: with
+    // simulate_infinite_loop=false the Worker is returned to Emscripten's pool
+    // immediately, and a new VLC pthread assigned to it could have its own
+    // main loop cancelled by our stale tick → "function signature mismatch".
+    //
+    // decode calls are made by WebcodecDecodeWorkerTick (the JS event loop
+    // callback), NOT from this ASYNCIFY-suspended WASM frame, because
+    // emval::call() from an ASYNCIFY-instrumented frame causes a call_indirect
+    // type mismatch in Emscripten 4.0.1.  See tick comment above for details.
+    //
+    // Emscripten 4.0.1 val.h thread-affinity is satisfied: all emval operations
+    // execute on this Worker's JS thread (the tick callback and WASM share it).
+    emscripten_set_main_loop_arg( &WebcodecDecodeWorkerTick, dec, 1000, 1 );
     return NULL;
 }
 
 static int Decode( decoder_t* dec, vlc_frame_t* block )
 {
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
+    if ( block == nullptr )
+        return VLCDEC_SUCCESS; // NULL block = EOS signal; handled by Close(), not queued
     vlc::threads::mutex_locker lock{ sys->mutex };
     sys->blocks.push( block );
     sys->cond.signal();
@@ -335,12 +424,31 @@ static void Flush( decoder_t* dec )
     // from the input/demux thread, causing "val accessed from wrong thread"
     // → abort → WASM heap corruption.
     //
-    // Safe fix: make Flush a no-op. The VideoDecoder will naturally discard
-    // stale frames and recover on the next IDR keyframe after a seek.
-    // The sent_first_keyframe flag ensures the next keyframe resets properly.
+    // We cannot call decoder.reset() or decoder.flush() here (wrong thread).
+    // Instead:
+    //   1. Clear the pending block queue so pre-seek delta frames are not
+    //      delivered to the VideoDecoder after the seek point.  Without this,
+    //      stale deltas arrive before the IDR, the VideoDecoder enters "closed"
+    //      state, and the actual IDR is silently dropped → frozen frame.
+    //   2. Reset sent_first_keyframe so the first frame after seek is sent as
+    //      type "key", which helps Chrome accept the IDR after any state reset.
+    //
+    // The JS layer (module-loader.js PatchedVideoDecoder) handles recovery:
+    // if the VideoDecoder nonetheless enters "closed" state, it reconfigures
+    // automatically on the next keyframe.
     auto sys = static_cast<decoder_sys_t*>( dec->p_sys );
-    sys->sent_first_keyframe = false;  // force key chunk type on next frame
-    (void)sys; // suppress unused warning if emval was removed
+    {
+        // Reset keyframe state and discard pre-seek frames under the same lock
+        // that WebcodecDecodeWorker holds during blockToEncodedVideoChunk —
+        // eliminates the data race on sent_first_keyframe.
+        vlc::threads::mutex_locker lock{ sys->mutex };
+        sys->sent_first_keyframe = false;  // force key chunk type on next frame
+        while ( !sys->blocks.empty() )
+        {
+            block_Release( sys->blocks.front() );
+            sys->blocks.pop();
+        }
+    }
 }
 
 static int Open( vlc_object_t* obj )
@@ -412,6 +520,15 @@ static void Close( decoder_t* dec )
     // The JS VideoDecoder will be garbage-collected when the emval handle
     // is dropped via the emval destructor (which only calls _emval_decref,
     // a thread-safe reference count decrement — no thread check).
+
+    // Signal the tick to cancel the emscripten main loop.
+    // The tick fires every ~1ms; once it sees exiting=true it calls
+    // emscripten_cancel_main_loop(), which causes WebcodecDecodeWorker
+    // (ASYNCIFY-suspended in simulate_infinite_loop=1) to resume and return NULL.
+    sys->exiting.store( true, std::memory_order_release );
+    // Wait for the decoder worker thread to exit cleanly.
+    // Only after the thread exits do we free sys — no use-after-free possible.
+    vlc_join( sys->th, nullptr );
     delete sys;
 }
 

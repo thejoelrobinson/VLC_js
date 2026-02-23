@@ -244,4 +244,92 @@ describe('MXF WebCodecs browser playback', () => {
     if (sharedResult.glCtxSet)    console.log('  ✓ Module.glCtx set from GL.currentContext.GLctx');
     if (sharedResult.renderPortSet) console.log('  ✓ Rendering MessageChannel established');
   }, 10_000);
+
+  // ── EOS crash regression ─────────────────────────────────────────────────
+  // Plays to the last few seconds by seeking to 97%, then waits for natural
+  // end-of-stream.  Catches "function signature mismatch" errors that only
+  // appear when the clip actually finishes (not detectable with the 10-frame
+  // test above, which stops long before EOS).
+  it('no crash when clip plays to natural end-of-stream', async () => {
+    if (!existsSync(MXF_FILE)) { console.warn('[skip] MXF file not found'); return; }
+    if (!browser)               { console.warn('[skip] browser not available'); return; }
+
+    const context = await browser.newContext();
+    const page    = await context.newPage();
+    const eosErrors = [];
+
+    page.on('pageerror', err => {
+      const msg = err.message || String(err);
+      if (!msg.includes('customCmd') && !msg.includes('[object Object]'))
+        eosErrors.push(msg);
+    });
+    page.on('console', msg => {
+      if (msg.type() === 'error') {
+        const t = msg.text();
+        if (!t.includes('customCmd') && !t.includes('[object Object]'))
+          eosErrors.push(t);
+      }
+    });
+
+    try {
+      await page.goto(SERVER_URL, { waitUntil: 'load', timeout: 60_000 });
+      await page.waitForFunction(
+        () => window.Module?._wasm_libvlc_init != null,
+        { timeout: 60_000, polling: 500 }
+      );
+
+      // Hook frame counter before file is uploaded
+      await page.evaluate(() => {
+        window.__eosFrames = 0;
+        const orig = window.Module?.vlcOnDecoderFrame;
+        if (orig) window.Module.vlcOnDecoderFrame = function(pid, frame) {
+          if (frame instanceof VideoFrame) window.__eosFrames++;
+          return orig.call(this, pid, frame);
+        };
+      });
+
+      await page.locator('#fpicker_btn').setInputFiles(MXF_FILE, { timeout: 10_000 });
+
+      // Wait for at least 5 decoded frames — confirms WebCodecs pipeline is live
+      await page.waitForFunction(
+        () => (window.__eosFrames || 0) >= 5,
+        { timeout: 30_000, polling: 300 }
+      );
+
+      // Jump to 97%: reaches EOS in a few seconds regardless of clip length
+      await page.evaluate(() => {
+        if (window.media_player && !window._vlcException)
+          window.media_player.set_position(0.97);
+      });
+
+      // Wait for natural EOS — stale-detection in _uiLoop sets _vlcAtEOS=true
+      // Give up to 90 s in case the clip is long or the machine is slow
+      await page.waitForFunction(
+        () => window._vlcAtEOS === true,
+        { timeout: 90_000, polling: 500 }
+      );
+
+      // Extra 2 s for any async error handlers (worker.onerror) to fire
+      await page.waitForTimeout(2_000);
+
+      const sigMismatch = eosErrors.filter(e =>
+        e.includes('signature mismatch') || e.includes('RuntimeError')
+      );
+
+      expect(
+        sigMismatch,
+        `"function signature mismatch" at EOS — VLC pipeline race during teardown:\n` +
+        sigMismatch.join('\n')
+      ).toHaveLength(0);
+
+      expect(
+        eosErrors.filter(e => e.includes('Aborted') || e.includes('heap')),
+        `WASM abort at EOS:\n${eosErrors.join('\n')}`
+      ).toHaveLength(0);
+
+      console.log('  ✓ EOS reached cleanly — no crash');
+    } finally {
+      await context.close();
+    }
+  }, 120_000); // 2-minute budget: covers 97%→EOS + 2s grace period
 });

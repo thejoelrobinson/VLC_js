@@ -1,6 +1,6 @@
 import { update_overlay, on_overlay_click } from "./lib/overlay.js";
 import { MediaPlayer } from "./lib/libvlc.js";
-import { isOPFSSupported, getCachedOPFSFile } from "./lib/opfs.js";
+import { isOPFSSupported, getCachedOPFSFile, copyFileToOPFSViaWorker, getOPFSNameForFile } from "./lib/opfs.js";
 let vlc_options = "";
 const showCanvas = new CustomEvent('toggleCanvas', { detail: { files: true } });
 const hideCanvas = new CustomEvent('toggleCanvas', { detail: { files: false } });
@@ -142,7 +142,21 @@ function createHandlers() {
                 window.Module.printErr('[post-exception status] ' + text);
         };
     };
+    // Helper: propagate the OPFS filename to the emjsfile C module so the
+    // WASM Worker can open a FileSystemSyncAccessHandle for fast reads.
+    // Module.vlc_opfs_name[1] is read by emjsfile.c's MAIN_THREAD_EM_ASM block
+    // and forwarded with the FileResult message.
+    function _setOpfsName(name) {
+        if (!window.Module) return;
+        if (!window.Module.vlc_opfs_name) window.Module.vlc_opfs_name = {};
+        window.Module.vlc_opfs_name[1] = name || undefined;
+    }
     function handleFiles() {
+        // Reset OPFS state when a new file is selected
+        window._vlcOPFSFile = null;
+        window._vlcOPFSCopyPromise = null;
+        window._vlcOPFSFileName = null;
+        _setOpfsName(null);
         // iterator in case the user selected multiple files.
         for (let i = 0; i < this.files.length; i++) {
             const name = this.files.item(i).name;
@@ -162,10 +176,33 @@ function createHandlers() {
             if (isOPFSSupported()) {
                 getCachedOPFSFile(originalFile).then((cached) => {
                     if (cached) {
-                        console.log("OPFS: using cached file for faster seeking");
+                        console.log('[vlcjs] OPFS: using previously cached file for faster seeking');
                         window.Module['vlc_access_file'][1] = cached;
+                        window._vlcOPFSFile = cached;
+                        // Activate SyncAccessHandle fast-read path in emjsfile.c
+                        const cachedName = getOPFSNameForFile(originalFile);
+                        window._vlcOPFSFileName = cachedName;
+                        _setOpfsName(cachedName);
+                        return;
                     }
-                    // No background copy — avoids event-loop interference during playback.
+                    // Not in cache — start Worker copy immediately so it is ready
+                    // by the time the user clicks play (or for the next session).
+                    // Worker runs on its own thread: no ASYNCIFY interference at EOS.
+                    window._vlcOPFSCopyPromise = copyFileToOPFSViaWorker(originalFile, (pct) => {
+                        if (pct === 100) console.log('[vlcjs] OPFS: background copy complete');
+                    });
+                    window._vlcOPFSCopyPromise.then((opfsFile) => {
+                        if (opfsFile) {
+                            console.log('[vlcjs] OPFS: Worker copy done — will use on next play');
+                            window._vlcOPFSFile = opfsFile;
+                            const opfsName = getOPFSNameForFile(originalFile);
+                            window._vlcOPFSFileName = opfsName;
+                            // Pre-arm the fast path so emjsfile uses SyncAccessHandle
+                            // even if the user hasn't clicked play yet.
+                            _setOpfsName(opfsName);
+                        }
+                        window._vlcOPFSCopyPromise = null;
+                    });
                 });
             }
         }
@@ -220,28 +257,41 @@ function createHandlers() {
             update_overlay();
             _lastUIUpdate = now;
             _lengthPollTick++;
-            // ── Duration polling ────────────────────────────────────────────────
-            // get_length() reads a cached value in VLC's player struct. It is safe
-            // ONLY during steady-state playback — NOT during init or EOS cleanup,
-            // when vlc_player_Lock may be held by VLC threads causing ASYNCIFY
-            // deadlock. Guards:
-            //   _lengthPollTick >= 4  → wait ~1s after playback starts
-            //   timeMs > 1000         → decoder is warmed up, not at tick 0
-            //   _staleCount === 0     → not in EOS cleanup phase (frames still live)
-            if (!_lengthKnown && window._vlcIsPlaying &&
-                window._vlcStateCache &&
-                window._vlcStateCache.timeMs > 1000 && // not at init (tick 0)
-                _staleCount === 0 && // not in EOS cleanup
-                _lengthPollTick >= 4 && // ≥1s since play started
-                _lengthPollTick % 8 === 0) { // every ~2s
-                try {
-                    const len = Number(media_player.get_length());
-                    if (len > 0) {
-                        window._vlcStateCache.lengthMs = len;
-                        _lengthKnown = true;
+            // ── End-of-stream detection ──────────────────────────────────────────
+            // timeMs stopped advancing → video ended naturally.
+            // Reset _vlcIsPlaying to prevent blocking VLC WASM calls from button
+            // clicks after EOS (they would ASYNCIFY-deadlock on vlc_player_Lock).
+            if (window._vlcIsPlaying && window._vlcStateCache) {
+                const currentTimeMs = window._vlcStateCache.timeMs;
+                if (currentTimeMs > 0 && currentTimeMs === _lastTimeMs) {
+                    _staleCount++;
+                    if (_staleCount >= 6) { // ~1.5s of stale time
+                        window._vlcIsPlaying = false;
+                        // Only flag true EOS if time is ≥95% through the clip.
+                        // Mid-video backward seeks temporarily close the VideoDecoder
+                        // (no frames for ~1.5s) and would otherwise set _vlcAtEOS
+                        // incorrectly, causing the next scrub to restart from pos 0.
+                        const cache2 = window._vlcStateCache;
+                        if (cache2 && cache2.lengthMs > 0 &&
+                                cache2.timeMs >= cache2.lengthMs * 0.95) {
+                            window._vlcAtEOS = true;
+                        }
+                        _staleCount = 0;
                     }
                 }
-                catch (e) { /* lock contended — retry next cycle */ }
+                else {
+                    _lastTimeMs = currentTimeMs;
+                    _staleCount = 0;
+                }
+            }
+            // ── EOS fallback: set duration from last known frame time ─────────────
+            // If the deferred length fetch (setTimeout in handlePlayPause) didn't
+            // fire (e.g. clip shorter than 3 s), derive duration from last frame.
+            if (window._vlcIsPlaying && window._vlcStateCache &&
+                !_lengthKnown && _staleCount >= 5 &&
+                window._vlcStateCache.timeMs > 0) {
+                window._vlcStateCache.lengthMs = window._vlcStateCache.timeMs + 100;
+                _lengthKnown = true;
             }
             // ── Restore webcodec options after successful avcodec fallback ─────────
             // If we fell back to avcodec and playback is working (>3s), restore the
@@ -253,33 +303,6 @@ function createHandlers() {
                     console.log('[vlcjs] avcodec fallback successful — restoring webcodec for next session');
                     localStorage.setItem('options', savedOpts);
                     localStorage.removeItem('vlc-saved-options');
-                }
-            }
-            // ── EOS fallback: set duration from last known frame time ─────────────
-            // If get_length() never succeeded (rare), derive approximate duration
-            // from the final frame's timestamp when EOS is detected below.
-            if (window._vlcIsPlaying && window._vlcStateCache &&
-                !_lengthKnown && _staleCount >= 5 &&
-                window._vlcStateCache.timeMs > 0) {
-                window._vlcStateCache.lengthMs = window._vlcStateCache.timeMs + 100;
-                _lengthKnown = true;
-            }
-            // ── End-of-stream detection ──────────────────────────────────────────
-            // timeMs stopped advancing → video ended naturally.
-            // Reset _vlcIsPlaying to prevent blocking VLC WASM calls from button
-            // clicks after EOS (they would ASYNCIFY-deadlock on vlc_player_Lock).
-            if (window._vlcIsPlaying && window._vlcStateCache) {
-                const currentTimeMs = window._vlcStateCache.timeMs;
-                if (currentTimeMs > 0 && currentTimeMs === _lastTimeMs) {
-                    _staleCount++;
-                    if (_staleCount >= 6) { // ~1.5s of stale time
-                        window._vlcIsPlaying = false;
-                        _staleCount = 0;
-                    }
-                }
-                else {
-                    _lastTimeMs = currentTimeMs;
-                    _staleCount = 0;
                 }
             }
         }
@@ -328,7 +351,7 @@ function createHandlers() {
     // libvlc_media_player_is_playing() on the main thread (it acquires
     // vlc_player_Lock → pthread_cond_timedwait → blocks main thread → abort).
     window._vlcIsPlaying = false;
-    function handlePlayPause() {
+    async function handlePlayPause() {
         if (window.files) {
             if (window._vlcIsPlaying) {
                 // set_pause(1) instead of pause() — avoids audio drain deadlock.
@@ -343,8 +366,28 @@ function createHandlers() {
                     window.location.reload();
                     return;
                 }
+                // Use OPFS-backed file if available — faster MXF random-access seeking.
+                if (window._vlcOPFSFile) {
+                    window.Module['vlc_access_file'][1] = window._vlcOPFSFile;
+                    window._vlcOPFSFile = null;
+                    // Ensure fast-read path is armed (may already be set from handleFiles)
+                    if (window._vlcOPFSFileName) _setOpfsName(window._vlcOPFSFileName);
+                    console.log('[vlcjs] OPFS: using cached file for playback (SyncAccessHandle fast path)');
+                } else if (window._vlcOPFSCopyPromise) {
+                    // Worker copy in progress — wait up to 200ms for a just-in-time win
+                    const opfsFile = await Promise.race([
+                        window._vlcOPFSCopyPromise,
+                        new Promise(r => setTimeout(() => r(null), 200)),
+                    ]);
+                    if (opfsFile) {
+                        window.Module['vlc_access_file'][1] = opfsFile;
+                        if (window._vlcOPFSFileName) _setOpfsName(window._vlcOPFSFileName);
+                        console.log('[vlcjs] OPFS: Worker copy finished just in time');
+                    }
+                }
                 media_player.play();
                 window._vlcIsPlaying = true;
+                window._vlcAtEOS = false; // clear EOS flag on manual play
                 // Reset position cache so the progress bar returns to the beginning.
                 // Setting timeMs = 0 also suppresses the stale-detection loop while
                 // VLC reinitialises after EOS — the guard `currentTimeMs > 0` means
@@ -361,6 +404,30 @@ function createHandlers() {
                     clearTimeout(_seekTimer);
                     _seekTimer = null;
                 }
+                // ── One-shot duration fetch ──────────────────────────────────────
+                // get_length() acquires vlc_player_Lock.  Calling it from the RAF
+                // loop is dangerous: on the tick where VLC starts EOS pipeline
+                // teardown it still holds vlc_player_Lock, so get_length() ASYNCIFY-
+                // suspends the main thread waiting for the lock → the main thread
+                // can no longer process VLC's GL proxy calls → VLC teardown stalls
+                // → permanent page freeze (tab unresponsive, can't even refresh).
+                //
+                // Fix: call get_length() exactly once, 3 s after play() starts,
+                // when VLC is in stable steady-state and nowhere near EOS.
+                // If the clip is shorter than 3 s the EOS fallback in _uiLoop
+                // derives lengthMs from the final VideoFrame timestamp instead.
+                _lengthKnown = false;
+                setTimeout(function() {
+                    if (_lengthKnown || window._vlcException || !window._vlcIsPlaying)
+                        return;
+                    try {
+                        const len = Number(media_player.get_length());
+                        if (len > 0) {
+                            window._vlcStateCache && (window._vlcStateCache.lengthMs = len);
+                            _lengthKnown = true;
+                        }
+                    } catch (e) { /* lock contended — EOS fallback will handle it */ }
+                }, 3000);
             }
         }
         else {
@@ -383,6 +450,7 @@ function createHandlers() {
     //   incoming frame position updates during an active drag.
     let _isScrubbing = false;
     let _wasPlayingBeforeScrub = false;
+    let _wasAtEOS = false; // EOS state captured at scrub-start, used in scrub-end
     // Shorter debounce during drag for responsiveness (vs 150ms at rest).
     const SCRUB_SEEK_DELAY_MS = 80;
     // Compute a [0, 1] position from a clientX coordinate relative to the bar.
@@ -396,6 +464,10 @@ function createHandlers() {
         _isScrubbing = true;
         window._vlcIsScrubbing = true;
         _wasPlayingBeforeScrub = window._vlcIsPlaying;
+        // Snapshot and clear _vlcAtEOS so stale detection mid-drag can't
+        // overwrite it; _scrubEnd reads _wasAtEOS for the EOS restart decision.
+        _wasAtEOS = window._vlcAtEOS;
+        window._vlcAtEOS = false;
         // Pause playback so seeking doesn't race with active decode.
         if (window._vlcIsPlaying && !window._vlcException) {
             media_player.set_pause(1);
@@ -441,7 +513,25 @@ function createHandlers() {
             _seekTimer = null;
         }
         if (!window._vlcException) {
-            media_player.set_position(finalPos);
+            if (_wasAtEOS) {
+                // Clip ended naturally (_wasAtEOS captured at scrub-start).
+                // Restart VLC so a new decoder is created, then seek to the
+                // clicked position and play from there.
+                _wasAtEOS = false;
+                media_player.play();
+                window._vlcIsPlaying = true;
+                if (window._vlcStateCache) {
+                    window._vlcStateCache.timeMs = 0;
+                    window._vlcStateCache.position = 0;
+                }
+                _lastTimeMs = -1;
+                _staleCount = 0;
+                media_player.set_position(finalPos);
+                // Leave playing — user can click pause if they want to stop.
+            }
+            else {
+                media_player.set_position(finalPos);
+            }
         }
         // Update cache with final position.
         const cache = window._vlcStateCache;
@@ -455,7 +545,7 @@ function createHandlers() {
         _lastTimeMs = -1;
         _staleCount = 0;
         update_overlay();
-        // Resume playback if it was playing before the scrub started.
+        // Resume playback if it was playing before the scrub started (mid-video scrub).
         if (_wasPlayingBeforeScrub && !window._vlcException) {
             media_player.set_pause(0);
             window._vlcIsPlaying = true;

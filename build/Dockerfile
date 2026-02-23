@@ -109,6 +109,11 @@ RUN chmod +x compile.sh create_main.sh patch_vlcjs_wrappers.sh
 COPY webcodec/ webcodec/
 COPY audio/ audio/
 
+# Copy OPFS-fast-read emjsfile access module — replaces VLC's stock emjsfile.c
+# with a version that uses FileSystemSyncAccessHandle for sub-ms random reads
+# (eliminates Blob.slice() + FileReaderSync overhead, Emscripten issue #6955)
+COPY emjsfile/ emjsfile/
+
 # Copy webaudio.js library — provides bridge functions (webaudio_getSampleRate,
 # webaudio_getChannels, webaudio_init) called by the WASM audio output module
 COPY js-libs/ js-libs/

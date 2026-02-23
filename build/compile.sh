@@ -217,6 +217,24 @@ if [ ! -d vlc ]; then
         diagnostic "No audio/ directory found — skipping audio worklet injection"
     fi
 
+    # ---- Step 3d: Inject OPFS-fast-read emjsfile access module ----
+    # Replaces VLC's stock emjsfile.c with an OPFS-aware version that uses
+    # FileSystemSyncAccessHandle for reads when the file is pre-copied to OPFS.
+    # This eliminates Blob.slice() + FileReaderSync overhead (Emscripten #6955)
+    # — the dominant bottleneck for MXF header seeking (500-2000ms).
+    if [ -d ../emjsfile ] && [ -f ../emjsfile/emjsfile.c ]; then
+        diagnostic "Injecting OPFS-fast-read emjsfile access module..."
+        if [ -f modules/access/emjsfile.c ]; then
+            cp ../emjsfile/emjsfile.c modules/access/emjsfile.c
+            diagnostic "  emjsfile.c (OPFS SyncAccessHandle fast-read version) injected"
+        else
+            diagnostic "  WARNING: modules/access/emjsfile.c not found — patches may not have run yet"
+            diagnostic "  Skipping emjsfile injection (will use VLC default)"
+        fi
+    else
+        diagnostic "No emjsfile/ directory found — skipping OPFS fast-read injection"
+    fi
+
     cd "${WORK_DIR}"
 else
     diagnostic "VLC source directory already exists, skipping clone"
