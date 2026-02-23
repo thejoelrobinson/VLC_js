@@ -138,6 +138,24 @@ function createHandlers(): void {
     // any subsequent VLC call (including play/pause/seek) will deadlock.
     // The only safe recovery is a full page reload.
     window._vlcException = true;
+
+    // Auto-fallback: if exception fires before any frames decoded,
+    // the webcodec decoder failed to initialize. Switch to avcodec
+    // (software H.264) and reload so the file can still play.
+    const hasFrames = window._vlcStateCache && window._vlcStateCache.timeMs > 0;
+    if (!hasFrames) {
+      const currentOpts = localStorage.getItem('options') ?? '';
+      if (!currentOpts.includes('avcodec')) {
+        // Save original options to restore after successful avcodec play
+        localStorage.setItem('vlc-saved-options', currentOpts);
+        localStorage.setItem('options',
+          '--codec=avcodec --aout=emworklet --avcodec-threads=1');
+        console.log('[vlcjs] webcodec failed early — falling back to avcodec, reloading...');
+        setTimeout(() => window.location.reload(), 300);
+        return;
+      }
+    }
+
     window.Module.setStatus = function(text: string): void {
       if (text) window.Module.printErr('[post-exception status] ' + text);
     };
@@ -260,6 +278,19 @@ function createHandlers(): void {
             _lengthKnown = true;
           }
         } catch(e) { /* lock contended — retry next cycle */ }
+      }
+
+      // ── Restore webcodec options after successful avcodec fallback ─────────
+      // If we fell back to avcodec and playback is working (>3s), restore the
+      // original webcodec options so the next session tries webcodec first.
+      if (!_lengthKnown && window._vlcIsPlaying &&
+          window._vlcStateCache && window._vlcStateCache.timeMs > 3000) {
+        const savedOpts = localStorage.getItem('vlc-saved-options');
+        if (savedOpts) {
+          console.log('[vlcjs] avcodec fallback successful — restoring webcodec for next session');
+          localStorage.setItem('options', savedOpts);
+          localStorage.removeItem('vlc-saved-options');
+        }
       }
 
       // ── EOS fallback: set duration from last known frame time ─────────────
